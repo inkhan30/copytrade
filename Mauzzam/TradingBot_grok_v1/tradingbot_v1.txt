@@ -1,0 +1,231 @@
+//+------------------------------------------------------------------+
+//| TradingBot.mq5                                                   |
+//| Your Name                                                        |
+//| Your Company                                                     |
+//+------------------------------------------------------------------+
+#property copyright "Your Company"
+#property link      "https://www.example.com"
+#property version   "1.00"
+
+// Input parameters
+input int TimeFrame = PERIOD_CURRENT; // Time frame to work on (e.g., PERIOD_M1, PERIOD_M5)
+input int MaxTradesPerDay = 5; // Maximum trades per day
+input bool OneTradeAtATime = true; // Allow only one trade at a time
+input double LotSize = 0.1; // Lot size
+input double SLPoints = 50.0; // Stop Loss in points (0 to disable)
+input double SLPercentage = 0.0; // Stop Loss as percentage (0 to disable)
+input bool UseTrailingSL = true; // Use Trailing Stop Loss
+input double TrailingSLPoints = 20.0; // Trailing SL in points (0 to disable)
+input double TrailingSLPercentage = 0.0; // Trailing SL as percentage (0 to disable)
+input bool UseTP = true; // Use Take Profit
+input double TPPoints = 100.0; // Take Profit in points (0 to disable)
+input double InitialCapital = 10000.0; // Initial capital for 50% check
+input bool UseTradingHours = true; // Use trading hours
+input int TradingStartHour = 9; // Start trading hour
+input int TradingStartMinute = 0; // Start trading minute
+input int TradingEndHour = 17; // End trading hour
+input int TradingEndMinute = 0; // End trading minute
+
+// Global variables
+double gInitialCapital;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                     |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   gInitialCapital = AccountEquity(); // Optionally use input InitialCapital
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                   |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   // Cleanup code here
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                              |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // Check trading hours
+   if (UseTradingHours)
+   {
+      datetime now = TimeCurrent();
+      int hour = TimeHour(now);
+      int minute = TimeMinute(now);
+      if (hour < TradingStartHour || (hour == TradingStartHour && minute < TradingStartMinute) ||
+          hour > TradingEndHour || (hour == TradingEndHour && minute > TradingEndMinute))
+      {
+         return; // Outside trading hours
+      }
+   }
+
+   // Check capital
+   double equity = AccountEquity();
+   if (equity < 0.5 * gInitialCapital)
+   {
+      return; // Equity below 50%
+   }
+
+   // Check number of trades today
+   int todayTrades = CountTodayTrades();
+   if (todayTrades >= MaxTradesPerDay)
+   {
+      return; // Max trades reached
+   }
+
+   // Check if there is an open position
+   if (OneTradeAtATime && PositionsTotal() > 0)
+   {
+      return; // Already have a position
+   }
+
+   // Example trading logic (replace with your strategy)
+   if (SomeCondition())
+   {
+      OpenTradeBuy();
+   }
+
+   // Manage existing positions
+   for (int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if (PositionSelectByTicket(ticket))
+      {
+         if (UseTrailingSL)
+         {
+            ApplyTrailingSL(ticket);
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Count trades opened today                                         |
+//+------------------------------------------------------------------+
+int CountTodayTrades()
+{
+   datetime now = TimeCurrent();
+   datetime startToday = now - (now % 86400);
+   datetime endToday = startToday + 86400;
+
+   HistorySelect(startToday, endToday);
+   int total = HistoryOrdersTotal();
+   int count = 0;
+   for (int i = 0; i < total; i++)
+   {
+      ulong ticket = HistoryOrderGetTicket(i);
+      if (ticket > 0 && HistoryOrderGetInteger(ticket, ORDER_MAGIC) == 123456)
+      {
+         count++;
+      }
+   }
+   return count;
+}
+
+//+------------------------------------------------------------------+
+//| Open a buy trade                                                  |
+//+------------------------------------------------------------------+
+void OpenTradeBuy()
+{
+   if (OneTradeAtATime && PositionsTotal() > 0) return;
+
+   double price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double sl = 0.0, tp = 0.0;
+
+   if (SLPoints > 0)
+   {
+      sl = price - SLPoints * _Point;
+   }
+   else if (SLPercentage > 0)
+   {
+      sl = price * (1 - SLPercentage / 100.0);
+   }
+
+   if (UseTP && TPPoints > 0)
+   {
+      tp = price + TPPoints * _Point;
+   }
+
+   MqlTradeRequest request;
+   MqlTradeResult result;
+   ZeroMemory(request);
+   ZeroMemory(result);
+   request.action = TRADE_ACTION_DEAL;
+   request.symbol = _Symbol;
+   request.volume = LotSize;
+   request.type = ORDER_TYPE_BUY;
+   request.price = price;
+   request.sl = sl;
+   request.tp = tp;
+   request.deviation = 20;
+   request.magic = 123456;
+   request.comment = "My EA";
+   request.type_filling = ORDER_FILLING_RETURN;
+
+   if (!OrderSend(request, result))
+   {
+      Print("OrderSend error ", GetLastError());
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Apply trailing stop loss                                          |
+//+------------------------------------------------------------------+
+void ApplyTrailingSL(ulong ticket)
+{
+   if (!UseTrailingSL) return;
+
+   double trailingSL = 0.0;
+   if (TrailingSLPoints > 0)
+   {
+      if (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+      {
+         double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         if (bid - PositionGetDouble(POSITION_PRICE_OPEN) > TrailingSLPoints * _Point)
+         {
+            trailingSL = bid - TrailingSLPoints * _Point;
+            if (trailingSL > PositionGetDouble(POSITION_SL))
+            {
+               MqlTradeRequest request;
+               MqlTradeResult result;
+               ZeroMemory(request);
+               ZeroMemory(result);
+               request.action = TRADE_ACTION_SLTP;
+               request.position = ticket;
+               request.sl = trailingSL;
+               request.tp = PositionGetDouble(POSITION_TP);
+               if (!OrderSend(request, result))
+               {
+                  Print("Move SL error ", GetLastError());
+               }
+            }
+         }
+      }
+   }
+   else if (TrailingSLPercentage > 0)
+   {
+      // Implement percentage-based trailing SL
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Example trading condition (replace with your strategy)             |
+//+------------------------------------------------------------------+
+bool SomeCondition()
+{
+   // Example: Buy when MA(10) crosses above MA(20)
+   double ma10[];
+   double ma20[];
+   ArraySetAsSeries(ma10, true);
+   ArraySetAsSeries(ma20, true);
+   int ma10Handle = iMA(_Symbol, _Period, 10, 0, MODE_SMA, PRICE_CLOSE);
+   int ma20Handle = iMA(_Symbol, _Period, 20, 0, MODE_SMA, PRICE_CLOSE);
+   CopyBuffer(ma10Handle, 0, 0, 3, ma10);
+   CopyBuffer(ma20Handle, 0, 0, 3, ma20);
+   return ma10[0] > ma20[0] && ma10[1] < ma20[1];
+}
