@@ -1,0 +1,100 @@
+//+------------------------------------------------------------------+
+//|                  Support Resistance Breakout EA                   |
+//+------------------------------------------------------------------+
+#include <Trade/Trade.mqh>  // Corrected include path
+
+input int SR_Period = 1;           // Lookback period for S/R levels
+input double StopLossPercent = 0.02;  // Stop loss percentage
+input double TakeProfitPercent = 0.02;// Take profit percentage
+input double LotSize = 0.1;          // Fixed lot size
+input int MagicNumber = 123456;      // EA identifier
+
+CTrade trade;
+double lockedSupport = 0;
+double lockedResistance = 0;
+bool levelsLocked = false;
+datetime lastBarTime = 0;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   trade.SetExpertMagicNumber(MagicNumber);
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // Only process at the start of new bar
+   if(TimeCurrent() < lastBarTime + PeriodSeconds()) return;
+   lastBarTime = TimeCurrent();
+   
+   // Get current positions
+   int positions = PositionsTotal();
+   
+   // Calculate support/resistance if no open positions
+   if(positions == 0 && !levelsLocked)
+   {
+      lockedSupport = iLow(_Symbol, _Period, iLowest(_Symbol, _Period, MODE_LOW, SR_Period, 1));
+      lockedResistance = iHigh(_Symbol, _Period, iHighest(_Symbol, _Period, MODE_HIGH, SR_Period, 1));
+      levelsLocked = true;
+      
+      // Create objects to visualize the levels
+      ObjectCreate(0, "SupportLevel", OBJ_HLINE, 0, 0, lockedSupport);
+      ObjectSetInteger(0, "SupportLevel", OBJPROP_COLOR, clrGreen);
+      ObjectSetInteger(0, "SupportLevel", OBJPROP_WIDTH, 2);
+      
+      ObjectCreate(0, "ResistanceLevel", OBJ_HLINE, 0, 0, lockedResistance);
+      ObjectSetInteger(0, "ResistanceLevel", OBJPROP_COLOR, clrRed);
+      ObjectSetInteger(0, "ResistanceLevel", OBJPROP_WIDTH, 2);
+   }
+   
+   // Check for breakout if levels are locked
+   if(levelsLocked && positions == 0)
+   {
+      double close = iClose(_Symbol, _Period, 1); // Previous close
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      
+      // Long entry (breakout above resistance)
+      if(bid > lockedResistance)
+      {
+         double sl = ask * (1 - StopLossPercent/100);
+         double tp = ask * (1 + TakeProfitPercent/100);
+         trade.Buy(LotSize, _Symbol, ask, sl, tp, "Resistance Breakout");
+      }
+      // Short entry (breakout below support)
+      else if(ask < lockedSupport)
+      {
+         double sl = bid * (1 + StopLossPercent/100);
+         double tp = bid * (1 - TakeProfitPercent/100);
+         trade.Sell(LotSize, _Symbol, bid, sl, tp, "Support Breakout");
+      }
+   }
+   
+   // Reset levels when position is closed
+   if(positions == 0 && levelsLocked)
+   {
+      // Check if we just closed a position
+      if(HistoryDealsTotal() > 0)
+      {
+         levelsLocked = false;
+         ObjectDelete(0, "SupportLevel");
+         ObjectDelete(0, "ResistanceLevel");
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   // Clean up chart objects
+   ObjectDelete(0, "SupportLevel");
+   ObjectDelete(0, "ResistanceLevel");
+}
