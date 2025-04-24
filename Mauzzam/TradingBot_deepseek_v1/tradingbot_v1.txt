@@ -1,222 +1,327 @@
 //+------------------------------------------------------------------+
-//|                                                   TradingBot.mq5 |
-//|                                    Copyright 2024, YourCompany.  |
-//|                                             https://www.yoursite |
+//|                                         SimpleScalperBot.mq5     |
+//|                        Copyright 2023, MetaQuotes Software Corp. |
+//|                                             https://www.mql5.com |
 //+------------------------------------------------------------------+
-#property copyright "Copyright 2024, YourCompany."
-#property link      "https://www.yoursite"
-#property version   "2.00"
-
-#include <Trade/Trade.mqh>
-
-//+------------------------------------------------------------------+
-//| Custom Signal Enum                                              |
-//+------------------------------------------------------------------+
-enum ENUM_SIGNAL {
-   SIGNAL_NONE,  // No signal
-   SIGNAL_BUY,   // Buy signal
-   SIGNAL_SELL   // Sell signal
-};
+#property copyright "Copyright 2023, MetaQuotes Software Corp."
+#property link      "https://www.mql5.com"
+#property version   "1.00"
 
 //+------------------------------------------------------------------+
 //| Input Parameters                                                 |
 //+------------------------------------------------------------------+
-input group "EMA Settings"
-input int EMA_Fast_Period = 12;                   // Fast EMA Period
-input int EMA_Slow_Period = 26;                   // Slow EMA Period
-input bool Use_Close_Price_Filter = true;         // Use close price filter
+input string   StrategySettings="--- Strategy Settings ---";
+input int      MAPeriod=14;                 // EMA Period
+input ENUM_TIMEFRAMES TimeFrame=PERIOD_M15; // Chart Timeframe
+input bool     UseBreakoutStrategy=true;    // Enable Breakout Strategy
+input int      BreakoutPeriod=20;           // Breakout Lookback Period
 
-input group "General Settings"
-input ENUM_TIMEFRAMES Timeframe = PERIOD_M5;      // Chart timeframe
-input int MaxTradesPerDay = 5;                    // Max trades/day
-input bool AllowMultipleTrades = false;           // Allow multiple trades
-input double LotSize = 0.1;                       // Trade lot size
+input string   RiskManagement="--- Risk Management ---";
+input double   LotSize=0.1;              // Trade Lot Size
+input bool     UseMoneyPercentSL=false;  // Use Percentage for SL
+input double   StopLoss=50;              // SL (Points or %)
+input double   TakeProfit=100;           // Take Profit (Points)
+input bool     UseTrailingSL=true;       // Enable Trailing SL
+input double   TrailingStep=10;          // Trailing SL Step
 
-input group "Risk Management"
-input double RiskPercentage = 1.0;                // Risk % per trade
-input int SL_Points = 50;                         // SL in points
-input int TP_Points = 100;                        // TP in points
-input bool Use_Trailing_SL = true;                // Enable Trailing SL
-input int Trailing_SL_Points = 20;                // Trailing SL points
-input int Trailing_SL_Activation = 10;            // Trailing activation (points)
+input string   TradeSettings="--- Trade Settings ---";
+input int      MaxTradesPerDay=10;       // Max Daily Trades
+input bool     SingleTrade=true;         // One Trade at a Time
+input int      MagicNumber=12345;        // EA Magic Number
 
-input group "Safety Checks"
-input double CapitalProtectionPercent = 50.0;     // Min capital %
-input int Min_SL_Distance = 10;                   // Min SL distance (points)
-
-input group "Trading Hours"
-input bool UseTradingHours = false;               // Enable trading hours
-input int TradingStartHour = 8;                   // Start hour (0-23)
-input int TradingEndHour = 16;                    // End hour (0-23)
+input string   TimeSettings="--- Time Settings ---";
+input bool     UseTradingHours=false;    // Enable Trading Hours
+input int      StartHour=8;              // Trading Start Hour
+input int      EndHour=16;               // Trading End Hour
 
 //+------------------------------------------------------------------+
 //| Global Variables                                                 |
 //+------------------------------------------------------------------+
-CTrade Trade;
-ulong MagicNumber = 12345;
-double InitialCapital;
-int DailyTradesCount = 0;
-datetime LastTradeDay = 0;
-
-// EMA Handles
-int emaFastHandle, emaSlowHandle;
-double pointValue;
-int digits;
-
+int            dailyTradesCount=0;       // Track daily trades
+datetime       lastTradeDate=0;          // Last trade date
+double         initialCapital=0;         // Initial account balance
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
 int OnInit()
-{
-   Trade.SetExpertMagicNumber(MagicNumber);
-   InitialCapital = AccountInfoDouble(ACCOUNT_BALANCE);
-   
-   // Get symbol information
-   pointValue = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-   
-   // Create EMA handles
-   emaFastHandle = iMA(_Symbol, Timeframe, EMA_Fast_Period, 0, MODE_EMA, PRICE_CLOSE);
-   emaSlowHandle = iMA(_Symbol, Timeframe, EMA_Slow_Period, 0, MODE_EMA, PRICE_CLOSE);
-   
-   if(emaFastHandle == INVALID_HANDLE || emaSlowHandle == INVALID_HANDLE)
-   {
-      Print("Error creating EMA handles");
-      return(INIT_FAILED);
-   }
-   
+  {
+// Store initial capital
+   initialCapital=AccountInfoDouble(ACCOUNT_BALANCE);
+   ResetDailyCounter();
    return(INIT_SUCCEEDED);
-}
-
+  }
 //+------------------------------------------------------------------+
 //| Expert deinitialization function                                 |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
-{
-   // Release EMA handles
-   IndicatorRelease(emaFastHandle);
-   IndicatorRelease(emaSlowHandle);
-}
-
+  {
+// Remove timer on deinit
+   EventKillTimer();
+  }
 //+------------------------------------------------------------------+
 //| Expert tick function                                             |
 //+------------------------------------------------------------------+
 void OnTick()
-{
+  {
+// Check for new day
    CheckDayChange();
-   ManageTrailingStops();
-   
-   if(!CheckTradingConditions()) return;
-   
-   ENUM_SIGNAL signal = CheckEntrySignal();
-   if(signal != SIGNAL_NONE)
-   {
+
+// Check basic trading conditions
+   if(!IsTradingAllowed()) return;
+
+// Check current market conditions
+   int signal = CheckTradingSignal();
+   if(signal != 0)
+     {
       ExecuteTrade(signal);
-      DailyTradesCount++;
-   }
-}
+     }
 
+// Manage open positions
+   ManageOpenTrades();
+  }
 //+------------------------------------------------------------------+
-//| Check EMA crossover signals with enhanced filtering              |
+//| Check if trading is allowed                                      |
 //+------------------------------------------------------------------+
-ENUM_SIGNAL CheckEntrySignal()
-{
-   double emaFast[2], emaSlow[2], closePrice[2];
-   
-   // Get indicator values
-   if(CopyBuffer(emaFastHandle, 0, 0, 2, emaFast) < 2 ||
-      CopyBuffer(emaSlowHandle, 0, 0, 2, emaSlow) < 2 ||
-      CopyClose(_Symbol, Timeframe, 0, 2, closePrice) < 2)
-   {
-      return SIGNAL_NONE;
-   }
-
-   // Normalize values
-   emaFast[0] = NormalizeDouble(emaFast[0], digits);
-   emaFast[1] = NormalizeDouble(emaFast[1], digits);
-   emaSlow[0] = NormalizeDouble(emaSlow[0], digits);
-   emaSlow[1] = NormalizeDouble(emaSlow[1], digits);
-   
-   // Check crossovers
-   bool bullishCross = emaFast[0] > emaSlow[0] && emaFast[1] <= emaSlow[1];
-   bool bearishCross = emaFast[0] < emaSlow[0] && emaFast[1] >= emaSlow[1];
-   
-   // Additional filters
-   if(bullishCross)
-   {
-      if(Use_Close_Price_Filter && closePrice[0] < emaSlow[0])
-         return SIGNAL_NONE;
-      return SIGNAL_BUY;
-   }
-   
-   if(bearishCross)
-   {
-      if(Use_Close_Price_Filter && closePrice[0] > emaSlow[0])
-         return SIGNAL_NONE;
-      return SIGNAL_SELL;
-   }
-   
-   return SIGNAL_NONE;
-}
-
-//+------------------------------------------------------------------+
-//| Execute trade with enhanced risk management                      |
-//+------------------------------------------------------------------+
-void ExecuteTrade(ENUM_SIGNAL signal)
-{
-   double price = (signal == SIGNAL_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) 
-                                       : SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double sl = CalculateSL(signal, price);
-   double tp = CalculateTP(signal, price);
-   
-   // Validate SL and TP
-   if(!ValidateSL(signal, price, sl)) return;
-   if(TP_Points > 0 && !ValidateTP(signal, price, tp)) return;
-   
-   // Calculate dynamic lot size based on risk
-   double lotSize = CalculateLotSize(price, sl);
-   
-   if(signal == SIGNAL_BUY)
-      Trade.Buy(lotSize, _Symbol, price, sl, tp);
-   else
-      Trade.Sell(lotSize, _Symbol, price, sl, tp);
-}
-
-//+------------------------------------------------------------------+
-//| Calculate position size based on risk percentage                 |
-//+------------------------------------------------------------------+
-double CalculateLotSize(double entryPrice, double slPrice)
-{
-   double riskAmount = AccountInfoDouble(ACCOUNT_EQUITY) * (RiskPercentage / 100);
-   double priceDistance = MathAbs(entryPrice - slPrice);
-   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   
-   if(priceDistance == 0 || tickValue == 0) return LotSize;
-   
-   double lots = (riskAmount / (priceDistance / pointValue)) / tickValue;
-   return NormalizeDouble(lots, 2);
-}
-
-//+------------------------------------------------------------------+
-//| Validate stop loss placement                                     |
-//+------------------------------------------------------------------+
-bool ValidateSL(ENUM_SIGNAL signal, double price, double sl)
-{
-   double minDistance = Min_SL_Distance * pointValue;
-   
-   if(signal == SIGNAL_BUY && sl >= price - minDistance)
-   {
-      Print("Invalid Buy SL: ", sl, " Price: ", price);
+bool IsTradingAllowed()
+  {
+// Check account equity protection
+   double currentEquity=AccountInfoDouble(ACCOUNT_EQUITY);
+   if(currentEquity < initialCapital*0.5)
+     {
+      Print("Trading stopped: Account below 50% capital protection");
       return false;
-   }
-   
-   if(signal == SIGNAL_SELL && sl <= price + minDistance)
-   {
-      Print("Invalid Sell SL: ", sl, " Price: ", price);
+     }
+
+// Check trading hours
+   if(UseTradingHours && !IsWithinTradingHours())
       return false;
-   }
-   
+
+// Check daily trade limit
+   if(dailyTradesCount >= MaxTradesPerDay)
+     {
+      Print("Daily trade limit reached");
+      return false;
+     }
+
+// Check single trade rule
+   if(SingleTrade && PositionsTotal() > 0)
+      return false;
+
    return true;
-}
+  }
+//+------------------------------------------------------------------+
+//| Check trading signal conditions                                  |
+//+------------------------------------------------------------------+
+int CheckTradingSignal()
+  {
+// Get indicator values
+   double emaValue = iMA(_Symbol,TimeFrame,MAPeriod,0,MODE_EMA,PRICE_CLOSE);
+   double currentPrice = SymbolInfoDouble(_Symbol,SYMBOL_BID);
 
-// ... [Keep other functions from previous version with improvements] ...
+// Trend direction check
+   bool bullishTrend = currentPrice > emaValue;
+   bool bearishTrend = currentPrice < emaValue;
+
+// Breakout detection
+   bool breakoutBuySignal = false;
+   bool breakoutSellSignal = false;
+   
+   if(UseBreakoutStrategy)
+     {
+      int highestBar = iHighest(_Symbol,TimeFrame,MODE_HIGH,BreakoutPeriod,0);
+      int lowestBar = iLowest(_Symbol,TimeFrame,MODE_LOW,BreakoutPeriod,0);
+      
+      double highestHigh = iHigh(_Symbol,TimeFrame,highestBar);
+      double lowestLow = iLow(_Symbol,TimeFrame,lowestBar);
+      
+      breakoutBuySignal = currentPrice > highestHigh;
+      breakoutSellSignal = currentPrice < lowestLow;
+     }
+
+// Generate final signals
+   bool buySignal = (bullishTrend || breakoutBuySignal);
+   bool sellSignal = (bearishTrend || breakoutSellSignal);
+
+   if(buySignal) return 1;
+   if(sellSignal) return -1;
+   return 0;
+  }
+//+------------------------------------------------------------------+
+//| Execute trade                                                    |
+//+------------------------------------------------------------------+
+void ExecuteTrade(int direction)
+  {
+// Calculate SL/TP
+   double sl = CalculateStopLoss(direction);
+   double tp = CalculateTakeProfit(direction);
+
+// Determine trade direction
+   ENUM_ORDER_TYPE orderType = direction > 0 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+
+// Initialize trade request properly
+   MqlTradeRequest request;
+   ZeroMemory(request);
+   request.action = TRADE_ACTION_DEAL;
+   request.symbol = _Symbol;
+   request.volume = LotSize;
+   request.type = orderType;
+   request.price = orderType==ORDER_TYPE_BUY ? 
+                  SymbolInfoDouble(_Symbol,SYMBOL_ASK) : 
+                  SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   request.sl = sl;
+   request.tp = tp;
+   request.deviation = 10;
+   request.magic = MagicNumber;
+
+// Send trade request
+   MqlTradeResult result;
+   if(!OrderSend(request, result))
+     {
+      Print("Trade execution failed: ", GetLastError());
+      return;
+     }
+
+// Update trade counters
+   dailyTradesCount++;
+   lastTradeDate=TimeCurrent();
+  }
+//+------------------------------------------------------------------+
+//| Manage open positions                                            |
+//+------------------------------------------------------------------+
+void ManageOpenTrades()
+  {
+// Trailing stop management
+   if(UseTrailingSL)
+     {
+      for(int i=PositionsTotal()-1; i>=0; i--)
+        {
+         ulong ticket=PositionGetTicket(i);
+         if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+           {
+            double currentSL = PositionGetDouble(POSITION_SL);
+            double currentPrice = PositionGetDouble(POSITION_PRICE_CURRENT);
+            double newSL = CalculateTrailingStop(currentSL, currentPrice, (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE));
+            
+            if(newSL != currentSL)
+              {
+               ModifyPositionSL(ticket, newSL);
+              }
+           }
+        }
+     }
+  }
+//+------------------------------------------------------------------+
+//| Calculate trailing stop loss                                     |
+//+------------------------------------------------------------------+
+double CalculateTrailingStop(double currentSL, double currentPrice, ENUM_POSITION_TYPE positionType)
+  {
+   double newSL=currentSL;
+   double pointsStep=TrailingStep*_Point;
+   
+   if(positionType == POSITION_TYPE_BUY)
+     {
+      newSL = currentPrice - pointsStep;
+      return (newSL > currentSL) ? newSL : currentSL;
+     }
+   else if(positionType == POSITION_TYPE_SELL)
+     {
+      newSL = currentPrice + pointsStep;
+      return (newSL < currentSL) ? newSL : currentSL;
+     }
+   return currentSL;
+  }
+//+------------------------------------------------------------------+
+//| Calculate stop loss                                              |
+//+------------------------------------------------------------------+
+double CalculateStopLoss(int direction)
+  {
+   double price = direction > 0 ? 
+                 SymbolInfoDouble(_Symbol,SYMBOL_ASK) : 
+                 SymbolInfoDouble(_Symbol,SYMBOL_BID);
+                 
+   if(UseMoneyPercentSL)
+     {
+      double riskAmount=AccountInfoDouble(ACCOUNT_BALANCE)*(StopLoss/100);
+      double tickValue=SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE);
+      double slPoints = NormalizeDouble(riskAmount/(tickValue*LotSize),0);
+      return direction > 0 ? 
+             price - slPoints*_Point : 
+             price + slPoints*_Point;
+     }
+   else
+     {
+      return direction > 0 ? 
+             price - StopLoss*_Point : 
+             price + StopLoss*_Point;
+     }
+  }
+//+------------------------------------------------------------------+
+//| Calculate take profit                                            |
+//+------------------------------------------------------------------+
+double CalculateTakeProfit(int direction)
+  {
+   if(TakeProfit <= 0) return 0;
+   
+   double price = direction > 0 ? 
+                 SymbolInfoDouble(_Symbol,SYMBOL_ASK) : 
+                 SymbolInfoDouble(_Symbol,SYMBOL_BID);
+                 
+   return direction > 0 ? 
+          price + TakeProfit*_Point : 
+          price - TakeProfit*_Point;
+  }
+//+------------------------------------------------------------------+
+//| Check if current time is within trading hours                    |
+//+------------------------------------------------------------------+
+bool IsWithinTradingHours()
+  {
+   MqlDateTime currentTime;
+   TimeToStruct(TimeCurrent(),currentTime);
+   
+   if(currentTime.hour >= StartHour && currentTime.hour < EndHour)
+      return true;
+      
+   return false;
+  }
+//+------------------------------------------------------------------+
+//| Check for new day and reset counter                              |
+//+------------------------------------------------------------------+
+void CheckDayChange()
+  {
+   MqlDateTime today;
+   TimeToStruct(TimeCurrent(), today);
+   MqlDateTime lastTrade;
+   TimeToStruct(lastTradeDate, lastTrade);
+   
+   if(lastTrade.day != today.day || 
+      lastTrade.mon != today.mon ||  // Corrected from 'month' to 'mon'
+      lastTrade.year != today.year)
+     {
+      ResetDailyCounter();
+     }
+  }
+//+------------------------------------------------------------------+
+//| Reset daily trade counter                                        |
+//+------------------------------------------------------------------+
+void ResetDailyCounter()
+  {
+   dailyTradesCount=0;
+   lastTradeDate=TimeCurrent();
+  }
+//+------------------------------------------------------------------+
+//| Modify position's stop loss                                      |
+//+------------------------------------------------------------------+
+bool ModifyPositionSL(ulong ticket, double newSL)
+  {
+   MqlTradeRequest request;
+   ZeroMemory(request);
+   request.action = TRADE_ACTION_SLTP;
+   request.position = ticket;
+   request.sl = newSL;
+   request.symbol = _Symbol;
+   request.magic = MagicNumber;
+   
+   MqlTradeResult result;
+   return OrderSend(request, result);
+  }
+//+------------------------------------------------------------------+
