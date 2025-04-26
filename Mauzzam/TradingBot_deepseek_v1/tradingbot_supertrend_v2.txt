@@ -15,10 +15,6 @@ datetime currentBarTime;
 int trendDirection = 0;
 double superTrendLine = 0;
 
-// Trailing management
-double extremePrice;  // Highest price for buys, lowest for sells
-int profitSteps;      // Number of profit steps achieved
-
 // Trend tracking variables
 int previousTrend = 0;
 double previousUpperBand = 0;
@@ -33,8 +29,6 @@ int OnInit()
         return(INIT_FAILED);
     }
     currentBarTime = 0;
-    extremePrice = 0;
-    profitSteps = 0;
     return(INIT_SUCCEEDED);
 }
 
@@ -125,35 +119,18 @@ void CheckAndAdjustTPSL()
     long type = PositionGetInteger(POSITION_TYPE);
     
     double profitStep = ProfitStepPoints * _Point;
-    double currentPrice = type == POSITION_TYPE_BUY ? 
-        SymbolInfoDouble(_Symbol, SYMBOL_ASK) : 
-        SymbolInfoDouble(_Symbol, SYMBOL_BID);
-
-    // Initialize extreme price on first adjustment
-    if(extremePrice == 0)
-    {
-        extremePrice = type == POSITION_TYPE_BUY ? entryPrice : entryPrice;
-    }
 
     if(type == POSITION_TYPE_BUY)
     {
-        // Update extreme price
-        if(currentPrice > extremePrice)
-        {
-            extremePrice = currentPrice;
-        }
+        double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+        double profitDistance = currentAsk - entryPrice;
         
-        // Calculate required profit distance from extreme
-        double requiredMovement = (profitSteps + 1) * profitStep;
-        if(extremePrice - entryPrice >= requiredMovement)
+        if(profitDistance >= profitStep)
         {
-            profitSteps++;
-            double newTP = entryPrice + (profitSteps * profitStep);
-            double newSL = entryPrice + ((profitSteps - 1) * profitStep);
-            
-            // Ensure SL never goes below breakeven
-            newSL = fmax(newSL, entryPrice);
-            
+            int steps = (int)(profitDistance / profitStep);
+            double newTP = entryPrice + (steps + 1) * profitStep;
+            double newSL = entryPrice + (steps - 1) * profitStep;
+
             if(newTP != currentTP || newSL != currentSL)
             {
                 trade.PositionModify(_Symbol, newSL, newTP);
@@ -162,23 +139,15 @@ void CheckAndAdjustTPSL()
     }
     else if(type == POSITION_TYPE_SELL)
     {
-        // Update extreme price
-        if(currentPrice < extremePrice)
-        {
-            extremePrice = currentPrice;
-        }
+        double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+        double profitDistance = entryPrice - currentBid;
         
-        // Calculate required profit distance from extreme
-        double requiredMovement = (profitSteps + 1) * profitStep;
-        if(entryPrice - extremePrice >= requiredMovement)
+        if(profitDistance >= profitStep)
         {
-            profitSteps++;
-            double newTP = entryPrice - (profitSteps * profitStep);
-            double newSL = entryPrice - ((profitSteps - 1) * profitStep);
-            
-            // Ensure SL never goes above breakeven
-            newSL = fmin(newSL, entryPrice);
-            
+            int steps = (int)(profitDistance / profitStep);
+            double newTP = entryPrice - (steps + 1) * profitStep;
+            double newSL = entryPrice - (steps - 1) * profitStep;
+
             if(newTP != currentTP || newSL != currentSL)
             {
                 trade.PositionModify(_Symbol, newSL, newTP);
@@ -198,12 +167,6 @@ void OnTick()
             currentBarTime = time[0];
             CalculateSuperTrend();
             ManageTrades();
-            // Reset trailing variables on new position
-            if(PositionSelect(_Symbol))
-            {
-                extremePrice = PositionGetDouble(POSITION_PRICE_OPEN);
-                profitSteps = 0;
-            }
         }
     }
 
