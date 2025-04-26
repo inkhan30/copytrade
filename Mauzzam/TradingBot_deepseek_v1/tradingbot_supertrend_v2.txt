@@ -1,0 +1,212 @@
+#include <Trade/Trade.mqh>
+
+CTrade trade;
+
+// Input parameters
+input double LotSize = 0.1;              // Lot size
+input ulong StopLossPoints = 200;        // Initial Stop Loss in points
+input ulong ProfitStepPoints = 1000;     // Profit Step in points
+input int ATRPeriod = 10;                // ATR Period
+input double Multiplier = 3.0;           // SuperTrend Multiplier
+
+// Global variables
+int atrHandle;
+datetime currentBarTime;
+int trendDirection = 0;
+double superTrendLine = 0;
+
+// Trailing management
+double extremePrice;  // Highest price for buys, lowest for sells
+int profitSteps;      // Number of profit steps achieved
+
+// Trend tracking variables
+int previousTrend = 0;
+double previousUpperBand = 0;
+double previousLowerBand = 0;
+
+int OnInit()
+{
+    atrHandle = iATR(_Symbol, _Period, ATRPeriod);
+    if(atrHandle == INVALID_HANDLE)
+    {
+        Print("Error creating ATR handle");
+        return(INIT_FAILED);
+    }
+    currentBarTime = 0;
+    extremePrice = 0;
+    profitSteps = 0;
+    return(INIT_SUCCEEDED);
+}
+
+void CalculateSuperTrend()
+{
+    MqlRates rates[2];
+    if(CopyRates(_Symbol, _Period, 1, 2, rates) != 2) return;
+    
+    double atrVal[1];
+    if(CopyBuffer(atrHandle, 0, 1, 1, atrVal) != 1) return;
+
+    double median = (rates[0].high + rates[0].low) / 2.0;
+    double upperBand = median + (Multiplier * atrVal[0]);
+    double lowerBand = median - (Multiplier * atrVal[0]);
+
+    if(previousUpperBand == 0 || previousLowerBand == 0)
+    {
+        previousUpperBand = upperBand;
+        previousLowerBand = lowerBand;
+        trendDirection = rates[0].close > upperBand ? 1 : -1;
+        return;
+    }
+
+    if(trendDirection == 1)
+    {
+        lowerBand = (lowerBand > previousLowerBand) ? lowerBand : previousLowerBand;
+        superTrendLine = lowerBand;
+    }
+    else
+    {
+        upperBand = (upperBand < previousUpperBand) ? upperBand : previousUpperBand;
+        superTrendLine = upperBand;
+    }
+
+    if(rates[0].close > superTrendLine && trendDirection != 1)
+    {
+        trendDirection = 1;
+        superTrendLine = lowerBand;
+    }
+    else if(rates[0].close < superTrendLine && trendDirection != -1)
+    {
+        trendDirection = -1;
+        superTrendLine = upperBand;
+    }
+
+    previousUpperBand = upperBand;
+    previousLowerBand = lowerBand;
+}
+
+void ManageTrades()
+{
+    bool positionExists = false;
+    if(PositionSelect(_Symbol))
+    {
+        long positionType = PositionGetInteger(POSITION_TYPE);
+        positionExists = (positionType == POSITION_TYPE_BUY && trendDirection == 1) ||
+                         (positionType == POSITION_TYPE_SELL && trendDirection == -1);
+    }
+
+    if(!positionExists)
+    {
+        if(PositionSelect(_Symbol)) trade.PositionClose(_Symbol);
+
+        if(trendDirection == 1) // Buy signal
+        {
+            double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+            double sl = ask - (StopLossPoints * _Point);
+            double tp = ask + (ProfitStepPoints * _Point);
+            trade.Buy(LotSize, _Symbol, ask, sl, tp, "SuperTrend Buy");
+        }
+        else if(trendDirection == -1) // Sell signal
+        {
+            double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+            double sl = bid + (StopLossPoints * _Point);
+            double tp = bid - (ProfitStepPoints * _Point);
+            trade.Sell(LotSize, _Symbol, bid, sl, tp, "SuperTrend Sell");
+        }
+    }
+}
+
+void CheckAndAdjustTPSL()
+{
+    if(!PositionSelect(_Symbol)) return;
+
+    double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+    double currentSL = PositionGetDouble(POSITION_SL);
+    double currentTP = PositionGetDouble(POSITION_TP);
+    long type = PositionGetInteger(POSITION_TYPE);
+    
+    double profitStep = ProfitStepPoints * _Point;
+    double currentPrice = type == POSITION_TYPE_BUY ? 
+        SymbolInfoDouble(_Symbol, SYMBOL_ASK) : 
+        SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+    // Initialize extreme price on first adjustment
+    if(extremePrice == 0)
+    {
+        extremePrice = type == POSITION_TYPE_BUY ? entryPrice : entryPrice;
+    }
+
+    if(type == POSITION_TYPE_BUY)
+    {
+        // Update extreme price
+        if(currentPrice > extremePrice)
+        {
+            extremePrice = currentPrice;
+        }
+        
+        // Calculate required profit distance from extreme
+        double requiredMovement = (profitSteps + 1) * profitStep;
+        if(extremePrice - entryPrice >= requiredMovement)
+        {
+            profitSteps++;
+            double newTP = entryPrice + (profitSteps * profitStep);
+            double newSL = entryPrice + ((profitSteps - 1) * profitStep);
+            
+            // Ensure SL never goes below breakeven
+            newSL = fmax(newSL, entryPrice);
+            
+            if(newTP != currentTP || newSL != currentSL)
+            {
+                trade.PositionModify(_Symbol, newSL, newTP);
+            }
+        }
+    }
+    else if(type == POSITION_TYPE_SELL)
+    {
+        // Update extreme price
+        if(currentPrice < extremePrice)
+        {
+            extremePrice = currentPrice;
+        }
+        
+        // Calculate required profit distance from extreme
+        double requiredMovement = (profitSteps + 1) * profitStep;
+        if(entryPrice - extremePrice >= requiredMovement)
+        {
+            profitSteps++;
+            double newTP = entryPrice - (profitSteps * profitStep);
+            double newSL = entryPrice - ((profitSteps - 1) * profitStep);
+            
+            // Ensure SL never goes above breakeven
+            newSL = fmin(newSL, entryPrice);
+            
+            if(newTP != currentTP || newSL != currentSL)
+            {
+                trade.PositionModify(_Symbol, newSL, newTP);
+            }
+        }
+    }
+}
+
+void OnTick()
+{
+    // Process SuperTrend signals on new bar
+    datetime time[1];
+    if(CopyTime(_Symbol, _Period, 0, 1, time) == 1)
+    {
+        if(currentBarTime != time[0])
+        {
+            currentBarTime = time[0];
+            CalculateSuperTrend();
+            ManageTrades();
+            // Reset trailing variables on new position
+            if(PositionSelect(_Symbol))
+            {
+                extremePrice = PositionGetDouble(POSITION_PRICE_OPEN);
+                profitSteps = 0;
+            }
+        }
+    }
+
+    // Check for TP/SL adjustments on every tick
+    CheckAndAdjustTPSL();
+}
