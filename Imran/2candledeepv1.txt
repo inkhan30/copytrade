@@ -1,0 +1,191 @@
+//+------------------------------------------------------------------+
+//|                                                  AdaptiveGold.mq5|
+//|                        Copyright 2023, MetaQuotes Software Corp.|
+//|                                             https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2023, MetaQuotes Software Corp."
+#property version   "1.00"
+#property strict
+
+input ENUM_TIMEFRAMES  TimeFrame = PERIOD_M15;     // Chart timeframe
+input int              MaxOpenTrades = 3;          // Maximum open trades
+input double           MinLotSize = 0.01;          // Minimum lot size
+input double           MaxLotSize = 0.05;          // Maximum lot size
+input int              SL_Points = 150;            // Stop Loss (points)
+input int              TP_Points = 300;            // Take Profit (points)
+input int              TrailingStep_Points = 50;   // Trailing Step (points)
+
+ulong magicNumber = 202310;
+double pipValue;
+datetime lastBarTime;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   pipValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE) * 
+              SymbolInfoDouble(_Symbol, SYMBOL_POINT) / 0.01;
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Check for new bar formation                                      |
+//+------------------------------------------------------------------+
+bool NewBar()
+{
+   datetime currentBarTime = iTime(_Symbol, TimeFrame, 0);
+   if(currentBarTime != lastBarTime)
+   {
+      lastBarTime = currentBarTime;
+      return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Candle pattern detection                                         |
+//+------------------------------------------------------------------+
+void CheckCandlePattern()
+{
+   double open1 = iOpen(_Symbol, TimeFrame, 1);
+   double close1 = iClose(_Symbol, TimeFrame, 1);
+   double open2 = iOpen(_Symbol, TimeFrame, 2);
+   double close2 = iClose(_Symbol, TimeFrame, 2);
+
+   // Bullish signal detection
+   if(close1 > open1 && close2 > open2)
+   {
+      ExecuteRandomOrder(ORDER_TYPE_BUY);
+   }
+   // Bearish signal detection
+   else if(close1 < open1 && close2 < open2)
+   {
+      ExecuteRandomOrder(ORDER_TYPE_SELL);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Execute random size order                                        |
+//+------------------------------------------------------------------+
+void ExecuteRandomOrder(ENUM_ORDER_TYPE orderType)
+{
+   double price = orderType == ORDER_TYPE_BUY ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : 
+                                       SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double lotSize = NormalizeDouble(MinLotSize + (MaxLotSize - MinLotSize) * MathRand() / 32767, 2);
+   
+   MqlTradeRequest request = {};
+   MqlTradeResult result = {};
+   
+   request.action = TRADE_ACTION_DEAL;
+   request.symbol = _Symbol;
+   request.volume = lotSize;
+   request.type = orderType;
+   request.price = price;
+   request.sl = orderType == ORDER_TYPE_BUY ? price - SL_Points * _Point : 
+                                            price + SL_Points * _Point;
+   request.tp = orderType == ORDER_TYPE_BUY ? price + TP_Points * _Point : 
+                                            price - TP_Points * _Point;
+   request.magic = magicNumber;
+   
+   if(!OrderSend(request, result))
+      Print("Order failed: ", GetLastError());
+}
+
+//+------------------------------------------------------------------+
+//| Manage open positions                                            |
+//+------------------------------------------------------------------+
+void ManageOpenPositions()
+{
+   for(int i = PositionsTotal()-1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == magicNumber)
+      {
+         double currentPrice = PositionGetDouble(POSITION_PRICE_CURRENT);
+         double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+         ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+         
+         // Trailing stop management
+         TrailingStopManagement(ticket, posType, currentPrice);
+         
+         // Reversal signal check
+         if(CheckReversalSignal(posType))
+            ClosePosition(ticket);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Trailing stop management                                         |
+//+------------------------------------------------------------------+
+void TrailingStopManagement(ulong ticket, ENUM_POSITION_TYPE posType, double currentPrice)
+{
+   double newSL = posType == POSITION_TYPE_BUY ? currentPrice - TrailingStep_Points * _Point : 
+                                               currentPrice + TrailingStep_Points * _Point;
+   double currentSL = PositionGetDouble(POSITION_SL);
+   
+   if((posType == POSITION_TYPE_BUY && newSL > currentSL) || 
+      (posType == POSITION_TYPE_SELL && newSL < currentSL))
+   {
+      MqlTradeRequest request = {};
+      MqlTradeResult result = {};
+      
+      request.action = TRADE_ACTION_SLTP;
+      request.position = ticket;
+      request.sl = newSL;
+      
+      OrderSend(request, result);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check for reversal signal                                        |
+//+------------------------------------------------------------------+
+bool CheckReversalSignal(ENUM_POSITION_TYPE posType)
+{
+   double currentOpen = iOpen(_Symbol, TimeFrame, 0);
+   double currentClose = iClose(_Symbol, TimeFrame, 0);
+   
+   if(posType == POSITION_TYPE_BUY && currentClose < currentOpen)
+      return true;
+   
+   if(posType == POSITION_TYPE_SELL && currentClose > currentOpen)
+      return true;
+   
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Close position                                                   |
+//+------------------------------------------------------------------+
+void ClosePosition(ulong ticket)
+{
+   MqlTradeRequest request = {};
+   MqlTradeResult result = {};
+   
+   request.action = TRADE_ACTION_DEAL;
+   request.position = ticket;
+   request.symbol = _Symbol;
+   request.volume = PositionGetDouble(POSITION_VOLUME);
+   request.type = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? 
+                ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+   request.price = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? 
+                 SymbolInfoDouble(_Symbol, SYMBOL_BID) : 
+                 SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   
+   OrderSend(request, result);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   if(NewBar() && PositionsTotal() < MaxOpenTrades)
+   {
+      CheckCandlePattern();
+   }
+   ManageOpenPositions();
+}
+//+------------------------------------------------------------------+
