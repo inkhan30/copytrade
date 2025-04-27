@@ -1,0 +1,161 @@
+#include <Trade/Trade.mqh>
+
+CTrade trade;
+
+// Input parameters
+input double LotSize = 0.1;              // Lot size
+input ulong StopLossPoints = 200;        // Initial Stop Loss in points
+input ulong ProfitStepPoints = 1000;     // Profit Step in points
+input int ConsecutiveBars = 3;           // Number of consecutive bars for trend confirmation
+
+// Global variables
+datetime currentBarTime;
+double highestPrice;    // For buy positions
+double lowestPrice;     // For sell positions
+double currentTP;
+double currentSL;
+double newTP_Global = 0;
+double newSL_Global = 0;
+
+
+int OnInit()
+{
+    currentBarTime = 0;
+    highestPrice = 0;
+    lowestPrice = 0;
+    return(INIT_SUCCEEDED);
+}
+
+bool CheckBuySignal()
+{
+    MqlRates rates[4];
+    if(CopyRates(_Symbol, _Period, 0, 4, rates) != 4) return false;
+    
+    // Check for 3 consecutive bullish candles
+    for(int i = 1; i <= ConsecutiveBars; i++)
+    {
+        if(rates[i].close <= rates[i-1].close) return false;
+    }
+    return true;
+}
+
+bool CheckSellSignal()
+{
+    MqlRates rates[4];
+    if(CopyRates(_Symbol, _Period, 0, 4, rates) != 4) return false;
+    
+    // Check for 3 consecutive bearish candles
+    for(int i = 1; i <= ConsecutiveBars; i++)
+    {
+        if(rates[i].close >= rates[i-1].close) return false;
+    }
+    return true;
+}
+
+void ManageTrades()
+{
+    bool positionExists = PositionSelect(_Symbol);
+    
+    if(!positionExists)
+    {
+        if(CheckBuySignal())
+        {
+            double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+            currentSL = ask - (StopLossPoints * _Point);
+            currentTP = ask + (ProfitStepPoints * _Point);
+            highestPrice = ask;
+            trade.Buy(LotSize, _Symbol, ask, currentSL, currentTP, "Bullish Trend Buy");
+        }
+        else if(CheckSellSignal())
+        {
+            double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+            currentSL = bid + (StopLossPoints * _Point);
+            currentTP = bid - (ProfitStepPoints * _Point);
+            lowestPrice = bid;
+            trade.Sell(LotSize, _Symbol, bid, currentSL, currentTP, "Bearish Trend Sell");
+        }
+    }
+}
+
+void CheckAndAdjustTPSL()
+{
+    if(!PositionSelect(_Symbol)) return;
+
+    long type = PositionGetInteger(POSITION_TYPE);
+    double price = type == POSITION_TYPE_BUY ? 
+                 SymbolInfoDouble(_Symbol, SYMBOL_ASK) : 
+                 SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    
+    double step = ProfitStepPoints * _Point;
+
+    if(type == POSITION_TYPE_BUY)
+    {
+        // Track highest price since entry
+        if(price > highestPrice) highestPrice = price;
+        
+        // Check if price moved enough to adjust
+        if(highestPrice >= currentTP)  
+        {
+            double newTP = currentTP + step;
+            double newSL = currentTP - step;  // Lock SL at previous TP
+            Print("STEP::",step," :: newTP : ",newTP," :: highestPrice::",highestPrice);
+            if(newTP_Global < newTP){              
+               newTP_Global = newTP;
+               newSL_Global = newSL;
+               if(trade.PositionModify(_Symbol, newSL, newTP))
+               {
+                   currentTP = newTP;
+                   currentSL = newSL;
+                   Print("Buy adjusted - TP: ", newTP, " SL: ", newSL);
+               }
+            }
+        }
+    }
+    else if(type == POSITION_TYPE_SELL)
+    {
+        // Track lowest price since entry
+        if(price < lowestPrice) lowestPrice = price;
+        
+        // Check if price moved enough to adjust
+        if(lowestPrice <= currentTP)
+        {
+            double newTP = currentTP - step;
+            double newSL = currentTP + step;  // Lock SL at previous TP
+            
+            if(newTP_Global==0){
+               newTP_Global = newTP;
+               newSL_Global = newSL;
+            
+               if(trade.PositionModify(_Symbol, newSL, newTP))
+               {
+                   currentTP = newTP;
+                   currentSL = newSL;
+                   Print("Sell adjusted - TP: ", newTP, " SL: ", newSL);
+               }
+            }else{
+               if(newTP_Global > newTP){
+                  if(trade.PositionModify(_Symbol, newSL, newTP))
+                  {
+                      currentTP = newTP;
+                      currentSL = newSL;
+                      Print("Sell adjusted - TP: ", newTP, " SL: ", newSL);
+                  }
+               }
+            }
+        }
+    }
+}
+
+void OnTick()
+{
+    datetime time[1];
+    if(CopyTime(_Symbol, _Period, 0, 1, time) == 1)
+    {
+        if(currentBarTime != time[0])
+        {
+            currentBarTime = time[0];
+            ManageTrades();
+        }
+    }
+    CheckAndAdjustTPSL();
+}

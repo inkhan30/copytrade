@@ -208,4 +208,4 @@ void OnTick()
 
     // Check for TP/SL adjustments on every tick
     CheckAndAdjustTPSL();
-}
+}gi
