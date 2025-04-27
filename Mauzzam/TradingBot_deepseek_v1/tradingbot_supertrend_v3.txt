@@ -9,20 +9,25 @@ input ulong ProfitStepPoints = 1000;     // Profit Step in points
 input int ATRPeriod = 10;                // ATR Period
 input double Multiplier = 3.0;           // SuperTrend Multiplier
 
+
 // Global variables
 int atrHandle;
 datetime currentBarTime;
 int trendDirection = 0;
 double superTrendLine = 0;
 
-// Trailing management
-double extremePrice;  // Highest price for buys, lowest for sells
-int profitSteps;      // Number of profit steps achieved
-
 // Trend tracking variables
 int previousTrend = 0;
 double previousUpperBand = 0;
 double previousLowerBand = 0;
+
+// Trailing management
+double highestPrice;  // For buy positions
+double lowestPrice;   // For sell positions
+double currentTP;
+double currentSL;
+double newTP_Global = 0;
+double newSL_Global = 0;
 
 int OnInit()
 {
@@ -33,8 +38,8 @@ int OnInit()
         return(INIT_FAILED);
     }
     currentBarTime = 0;
-    extremePrice = 0;
-    profitSteps = 0;
+    highestPrice = 0;
+    lowestPrice = 0;
     return(INIT_SUCCEEDED);
 }
 
@@ -101,16 +106,18 @@ void ManageTrades()
         if(trendDirection == 1) // Buy signal
         {
             double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-            double sl = ask - (StopLossPoints * _Point);
-            double tp = ask + (ProfitStepPoints * _Point);
-            trade.Buy(LotSize, _Symbol, ask, sl, tp, "SuperTrend Buy");
+            currentSL = ask - (StopLossPoints * _Point);
+            currentTP = ask + (ProfitStepPoints * _Point);
+            highestPrice = ask;
+            trade.Buy(LotSize, _Symbol, ask, currentSL, currentTP, "SuperTrend Buy");
         }
         else if(trendDirection == -1) // Sell signal
         {
             double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-            double sl = bid + (StopLossPoints * _Point);
-            double tp = bid - (ProfitStepPoints * _Point);
-            trade.Sell(LotSize, _Symbol, bid, sl, tp, "SuperTrend Sell");
+            currentSL = bid + (StopLossPoints * _Point);
+            currentTP = bid - (ProfitStepPoints * _Point);
+            lowestPrice = bid;
+            trade.Sell(LotSize, _Symbol, bid, currentSL, currentTP, "SuperTrend Sell");
         }
     }
 }
@@ -119,70 +126,68 @@ void CheckAndAdjustTPSL()
 {
     if(!PositionSelect(_Symbol)) return;
 
-    double entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-    double currentSL = PositionGetDouble(POSITION_SL);
-    double currentTP = PositionGetDouble(POSITION_TP);
     long type = PositionGetInteger(POSITION_TYPE);
+    double price = type == POSITION_TYPE_BUY ? 
+                 SymbolInfoDouble(_Symbol, SYMBOL_ASK) : 
+                 SymbolInfoDouble(_Symbol, SYMBOL_BID);
     
-    double profitStep = ProfitStepPoints * _Point;
-    double currentPrice = type == POSITION_TYPE_BUY ? 
-        SymbolInfoDouble(_Symbol, SYMBOL_ASK) : 
-        SymbolInfoDouble(_Symbol, SYMBOL_BID);
-
-    // Initialize extreme price on first adjustment
-    if(extremePrice == 0)
-    {
-        extremePrice = type == POSITION_TYPE_BUY ? entryPrice : entryPrice;
-    }
+    double step = ProfitStepPoints * _Point;
 
     if(type == POSITION_TYPE_BUY)
     {
-        // Update extreme price
-        if(currentPrice > extremePrice)
-        {
-            extremePrice = currentPrice;
-        }
+        // Track highest price since entry
+        if(price > highestPrice) highestPrice = price;
         
-        // Calculate required profit distance from extreme
-        double requiredMovement = (profitSteps + 1) * profitStep;
-        if(extremePrice - entryPrice >= requiredMovement)
+        // Check if price moved enough to adjust
+        if(highestPrice >= currentTP)
         {
-            profitSteps++;
-            double newTP = entryPrice + (profitSteps * profitStep);
-            double newSL = entryPrice + ((profitSteps - 1) * profitStep);
+            double newTP = currentTP + step;
+            double newSL = currentTP;  // Lock SL at previous TP
             
-            // Ensure SL never goes below breakeven
-            newSL = fmax(newSL, entryPrice);
-            
-            if(newTP != currentTP || newSL != currentSL)
-            {
-                trade.PositionModify(_Symbol, newSL, newTP);
-            }
+            if(newTP_Global < newTP){
+               newTP_Global = newTP;
+               newSL_Global = newSL;
+               if(trade.PositionModify(_Symbol, newSL, newTP))
+               {
+                   currentTP = newTP;
+                   currentSL = newSL;
+                   Print("Sell adjusted - TP: ", newTP, " SL: ", newSL, " Global TP:",newTP_Global," Global SL:",newSL_Global);
+               }
+            }            
         }
     }
     else if(type == POSITION_TYPE_SELL)
     {
-        // Update extreme price
-        if(currentPrice < extremePrice)
-        {
-            extremePrice = currentPrice;
-        }
+        // Track lowest price since entry
+        if(price < lowestPrice) lowestPrice = price;
         
-        // Calculate required profit distance from extreme
-        double requiredMovement = (profitSteps + 1) * profitStep;
-        if(entryPrice - extremePrice >= requiredMovement)
+        // Check if price moved enough to adjust
+        if(lowestPrice <= currentTP)
         {
-            profitSteps++;
-            double newTP = entryPrice - (profitSteps * profitStep);
-            double newSL = entryPrice - ((profitSteps - 1) * profitStep);
+            double newTP = currentTP - step;
+            double newSL = currentTP;  // Lock SL at previous TP
             
-            // Ensure SL never goes above breakeven
-            newSL = fmin(newSL, entryPrice);
-            
-            if(newTP != currentTP || newSL != currentSL)
-            {
-                trade.PositionModify(_Symbol, newSL, newTP);
-            }
+            if(newTP_Global==0){
+               newTP_Global = newTP;
+               newSL_Global = newSL;            
+               if(trade.PositionModify(_Symbol, newSL, newTP))
+               {
+                   currentTP = newTP;
+                   currentSL = newSL;
+                   Print("Sell adjusted - TP: ", newTP, " SL: ", newSL, " Global TP:",newTP_Global," Global SL:",newSL_Global);
+               }
+            }else{
+               if(newTP_Global > newTP){
+                  newTP_Global = newTP;
+                  newSL_Global = newSL;            
+                  if(trade.PositionModify(_Symbol, newSL, newTP))
+                  {
+                      currentTP = newTP;
+                      currentSL = newSL;
+                      Print("Sell adjusted - TP: ", newTP, " SL: ", newSL, " Global TP:",newTP_Global," Global SL:",newSL_Global);
+                  }
+               }
+            }           
         }
     }
 }
@@ -198,12 +203,6 @@ void OnTick()
             currentBarTime = time[0];
             CalculateSuperTrend();
             ManageTrades();
-            // Reset trailing variables on new position
-            if(PositionSelect(_Symbol))
-            {
-                extremePrice = PositionGetDouble(POSITION_PRICE_OPEN);
-                profitSteps = 0;
-            }
         }
     }
 
