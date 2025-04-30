@@ -1,0 +1,298 @@
+#include <Trade/Trade.mqh>
+#include <Trade/SymbolInfo.mqh>
+#include <Trade/TerminalInfo.mqh>   // Provides CTerminalInfo and IsTradeAllowed()
+
+//+------------------------------------------------------------------+
+//| Expert input parameters                                         |
+//+------------------------------------------------------------------+
+input double LotSize            = 0.01;    // Lot size
+input ulong  StopLossPoints     = 5000;    // Stop Loss (points)
+input ulong  ProfitStepPoints   = 1200;    // Profit Step (points)
+input int    ConsecutiveBars    = 3;       // Bars to confirm trend
+input bool   EnableCounterTrade = true;    // Enable counter-trade
+input int    TradeRetryMax      = 5;       // Max retries when trading is disallowed
+input int    TradeRetryDelayMs  = 200;     // Delay between retries (ms)
+
+//+------------------------------------------------------------------+
+//| Global objects                                                  |
+//+------------------------------------------------------------------+
+CTerminalInfo terminal_info;  // to check trading permission/context
+CTrade         trade;         
+datetime       currentBarTime = 0;
+double         highestPrice   = 0;
+double         lowestPrice    = 0;
+double         currentTP      = 0;
+double         currentSL      = 0;
+bool           counterTradeOpened = false;
+bool           hedgeOpened = false;
+ulong          hedgeTicket = 0;
+
+//+------------------------------------------------------------------+
+//| Wrapper: Buy with permission check & retry                       |
+//+------------------------------------------------------------------+
+bool SendBuyOrder(double price, double sl, double tp, string comment, double lot)
+{
+   ResetLastError();
+   int retries = 0;
+   // wait until trading is allowed
+   while(!terminal_info.IsTradeAllowed())
+   {
+      if(retries++ >= TradeRetryMax)
+      {
+         PrintFormat("[%s] Buy '%s' still disallowed after %d retries",
+                     TimeToString(TimeCurrent(), TIME_SECONDS),
+                     comment, retries);
+         return(false);
+      }
+      Sleep(TradeRetryDelayMs);
+   }
+   if(!trade.Buy(lot, _Symbol, price, sl, tp, comment))
+   {
+      int err = GetLastError();
+      PrintFormat("[%s] Buy '%s' failed err=%d",
+                  TimeToString(TimeCurrent(), TIME_SECONDS),
+                  comment, err);
+      return(false);
+   }
+   return(true);
+}
+
+//+------------------------------------------------------------------+
+//| Wrapper: Sell with permission check & retry                      |
+//+------------------------------------------------------------------+
+bool SendSellOrder(double price, double sl, double tp, string comment, double lot)
+{
+   ResetLastError();
+   int retries = 0;
+   while(!terminal_info.IsTradeAllowed())
+   {
+      if(retries++ >= TradeRetryMax)
+      {
+         PrintFormat("[%s] Sell '%s' still disallowed after %d retries",
+                     TimeToString(TimeCurrent(), TIME_SECONDS),
+                     comment, retries);
+         return(false);
+      }
+      Sleep(TradeRetryDelayMs);
+   }
+   if(!trade.Sell(lot, _Symbol, price, sl, tp, comment))
+   {
+      int err = GetLastError();
+      PrintFormat("[%s] Sell '%s' failed err=%d",
+                  TimeToString(TimeCurrent(), TIME_SECONDS),
+                  comment, err);
+      return(false);
+   }
+   return(true);
+}
+
+//+------------------------------------------------------------------+
+//| Wrapper: Modify SL/TP with permission check & retry             |
+//+------------------------------------------------------------------+
+bool SendModifyOrder(double sl, double tp, string comment)
+{
+   ResetLastError();
+   int retries = 0;
+   while(!terminal_info.IsTradeAllowed())
+   {
+      if(retries++ >= TradeRetryMax)
+      {
+         PrintFormat("[%s] Modify '%s' still disallowed after %d retries",
+                     TimeToString(TimeCurrent(), TIME_SECONDS),
+                     comment, retries);
+         return(false);
+      }
+      Sleep(TradeRetryDelayMs);
+   }
+   if(!trade.PositionModify(_Symbol, sl, tp))
+   {
+      int err = GetLastError();
+      PrintFormat("[%s] Modify '%s' failed err=%d",
+                  TimeToString(TimeCurrent(), TIME_SECONDS),
+                  comment, err);
+      return(false);
+   }
+   return(true);
+}
+
+//+------------------------------------------------------------------+
+//| Check for bullish trend                                         |
+//+------------------------------------------------------------------+
+bool CheckBuySignal()
+{
+   MqlRates rates[100];
+   int needed = ConsecutiveBars + 1;
+   if(CopyRates(_Symbol, _Period, 0, needed, rates) != needed)
+      return(false);
+   for(int i = 1; i < needed; i++)
+      if(rates[i].close <= rates[i-1].close)
+         return(false);
+   return(true);
+}
+
+//+------------------------------------------------------------------+
+//| Check for bearish trend                                         |
+//+------------------------------------------------------------------+
+bool CheckSellSignal()
+{
+   MqlRates rates[100];
+   int needed = ConsecutiveBars + 1;
+   if(CopyRates(_Symbol, _Period, 0, needed, rates) != needed)
+      return(false);
+   for(int i = 1; i < needed; i++)
+      if(rates[i].close >= rates[i-1].close)
+         return(false);
+   return(true);
+}
+
+//+------------------------------------------------------------------+
+//| Manage trend-based entries                                      |
+//+------------------------------------------------------------------+
+void ManageTrades()
+{
+   if(!PositionSelect(_Symbol))
+   {
+      counterTradeOpened = false;
+      hedgeOpened = false;
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+      if(CheckBuySignal())
+      {
+         currentSL = ask - StopLossPoints * _Point;
+         currentTP = ask + ProfitStepPoints * _Point;
+         highestPrice = ask;
+         SendBuyOrder(ask, currentSL, currentTP, "Trend Buy", LotSize);
+      }
+      else if(CheckSellSignal())
+      {
+         currentSL = bid + StopLossPoints * _Point;
+         currentTP = bid - ProfitStepPoints * _Point;
+         lowestPrice = bid;
+         SendSellOrder(bid, currentSL, currentTP, "Trend Sell", LotSize);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Open hedges at 50% of SL distance                                |
+//+------------------------------------------------------------------+
+void CheckCounterTradeCondition()
+{
+   if(!EnableCounterTrade || counterTradeOpened || !PositionSelect(_Symbol))
+      return;
+
+   long  type    = PositionGetInteger(POSITION_TYPE);
+   double entry  = PositionGetDouble(POSITION_PRICE_OPEN);
+   double price  = (type==POSITION_TYPE_BUY)
+                   ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+                   : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double halfSL = StopLossPoints * _Point / 2.0;
+
+   if(type==POSITION_TYPE_BUY && price<=entry-halfSL)
+   {
+      double sl = price + StopLossPoints * _Point;
+      double tp = price - ProfitStepPoints * _Point;
+      if(SendSellOrder(price, sl, tp, "Counter Sell", LotSize))
+         counterTradeOpened = true;
+   }
+   else if(type==POSITION_TYPE_SELL && price>=entry+halfSL)
+   {
+      double sl = price - StopLossPoints * _Point;
+      double tp = price + ProfitStepPoints * _Point;
+      if(SendBuyOrder(price, sl, tp, "Counter Buy", LotSize))
+         counterTradeOpened = true;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Step-based TP/SL adjustment                                     |
+//+------------------------------------------------------------------+
+void CheckAndAdjustTPSL()
+{
+   if(!PositionSelect(_Symbol)) return;
+
+   long  type  = PositionGetInteger(POSITION_TYPE);
+   double price = (type==POSITION_TYPE_BUY)
+                  ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+                  : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double step  = ProfitStepPoints * _Point;
+
+   if(type==POSITION_TYPE_BUY)
+   {
+      highestPrice = MathMax(highestPrice, price);
+      if(highestPrice >= currentTP)
+      {
+         double newTP = currentTP + step;
+         double newSL = currentTP - step/2.0;
+         if(SendModifyOrder(newSL, newTP, "Adjust Buy"))
+         {
+            currentSL = newSL; currentTP = newTP;
+         }
+      }
+   }
+   else
+   {
+      lowestPrice = MathMin(lowestPrice, price);
+      if(lowestPrice <= currentTP)
+      {
+         double newTP = currentTP - step;
+         double newSL = currentTP + step/2.0;
+         if(SendModifyOrder(newSL, newTP, "Adjust Sell"))
+         {
+            currentSL = newSL; currentTP = newTP;
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check for loss and open hedge position                          |
+//+------------------------------------------------------------------+
+void CheckLossAndHedge()
+{
+   if(!PositionSelect(_Symbol) || hedgeOpened)
+      return;
+
+   double currentProfit = PositionGetDouble(POSITION_PROFIT);
+   if(currentProfit < -5.0)
+   {
+      long type = PositionGetInteger(POSITION_TYPE);
+      double price = (type == POSITION_TYPE_BUY)
+                     ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+                     : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double sl = (type == POSITION_TYPE_BUY)
+                  ? price + StopLossPoints * _Point
+                  : price - StopLossPoints * _Point;
+      double tp = (type == POSITION_TYPE_BUY)
+                  ? price - ProfitStepPoints * _Point
+                  : price + ProfitStepPoints * _Point;
+      double hedgeLotSize = LotSize * 2.0;
+      bool result = false;
+      if(type == POSITION_TYPE_BUY)
+         result = SendSellOrder(price, sl, tp, "Hedge Sell", hedgeLotSize);
+      else
+         result = SendBuyOrder(price, sl, tp, "Hedge Buy", hedgeLotSize);
+      if(result)
+      {
+         hedgeOpened = true;
+         // Store hedge ticket
+         for(int i=0; i<PositionsTotal(); i++)
+         {
+            if(PositionGetTicket(i))
+            {
+               if(PositionGetInteger(POSITION_TYPE) != type)
+               {
+                  hedgeTicket = PositionGetInteger(POSITION_TICKET);
+                  break;
+               }
+            }
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check
+::contentReference[oaicite:4]{index=4}
+ 
