@@ -6,13 +6,15 @@
 CTrade trade;
 
 //+------------------------------------------------------------------+
-//| User Inputs - All USD-Based + Fixed Lot Size                    |
+//| User Inputs                                                      |
 //+------------------------------------------------------------------+
-input double   FixedLotSize        = 0.01;       // User-defined fixed lot size (initial)
-input double   TakeProfitUSD       = 5.0;        // Close all trades when total profit reaches this
-input double   LossThresholdUSD    = 5.0;        // Open next level when trade loss exceeds this
-input int      MaxLevels           = 5;          // Maximum martingale levels
-input string   TradeDirection      = "BUY_SELL"; // "BUY", "SELL", "BUY_SELL"
+input bool     EnableMartingale     = true;         // Enable Martingale logic
+input bool     EnableTakeProfit     = true;         // Enable closing on total profit
+input double   FixedLotSize         = 0.01;         // Initial lot size
+input double   TakeProfitUSD        = 5.0;          // Close all when profit reaches this
+input double   LossThresholdUSD     = 5.0;          // Open next level if loss > this
+input int      MaxLevels            = 5;            // Max number of Martingale levels
+input string   TradeDirection       = "BUY_SELL";   // "BUY", "SELL", "BUY_SELL"
 
 //+------------------------------------------------------------------+
 //| Helper Functions                                                 |
@@ -21,8 +23,10 @@ double GetTotalProfit()
 {
    double total = 0.0;
    for(int i = 0; i < PositionsTotal(); i++)
-      if(PositionGetSymbol(i) == _Symbol)
+   {
+      if(PositionGetSymbol(i) == _Symbol && PositionSelect(_Symbol))
          total += PositionGetDouble(POSITION_PROFIT);
+   }
    return total;
 }
 
@@ -30,14 +34,16 @@ int CountMartingaleLevels()
 {
    int count = 0;
    for(int i = 0; i < PositionsTotal(); i++)
+   {
       if(PositionGetSymbol(i) == _Symbol)
          count++;
+   }
    return count;
 }
 
 double CalculateNextLot(int level)
 {
-   return NormalizeDouble(FixedLotSize * MathPow(2, level), 2); // Martingale doubling
+   return NormalizeDouble(FixedLotSize * MathPow(2, level), 2);
 }
 
 //+------------------------------------------------------------------+
@@ -71,9 +77,7 @@ void OpenMartingaleOrder()
    bool result = trade.PositionOpen(_Symbol, type, lot, price, 0.0, 0.0);
 
    if (!result)
-   {
       Print("Order failed: ", trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
-   }
 }
 
 //+------------------------------------------------------------------+
@@ -81,12 +85,15 @@ void OpenMartingaleOrder()
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   // Close all if profit target is hit
-   if(GetTotalProfit() >= TakeProfitUSD)
+   if(!EnableMartingale && !EnableTakeProfit)
+      return;
+
+   // 1. Close all if profit target hit
+   if(EnableTakeProfit && GetTotalProfit() >= TakeProfitUSD)
    {
       for(int i = PositionsTotal() - 1; i >= 0; i--)
       {
-         if(PositionGetSymbol(i) == _Symbol)
+         if(PositionGetSymbol(i) == _Symbol && PositionSelect(_Symbol))
          {
             ulong ticket = PositionGetTicket(i);
             trade.PositionClose(ticket);
@@ -95,23 +102,28 @@ void OnTick()
       return;
    }
 
-   // If no positions, start first trade
-   if(CountMartingaleLevels() == 0)
+   // 2. Open initial order if none exists
+   int levelCount = CountMartingaleLevels();
+   if(levelCount == 0 && EnableMartingale)
    {
       OpenMartingaleOrder();
       return;
    }
 
-   // Check if any trade exceeds loss threshold
-   for(int i = 0; i < PositionsTotal(); i++)
+   // 3. Check for loss and open next step if needed
+   if(EnableMartingale && levelCount < MaxLevels)
    {
-      if(PositionGetSymbol(i) != _Symbol) continue;
-
-      double loss = PositionGetDouble(POSITION_PROFIT);
-      if(loss < -LossThresholdUSD && CountMartingaleLevels() < MaxLevels)
+      for(int i = 0; i < PositionsTotal(); i++)
       {
-         OpenMartingaleOrder();
-         break;
+         if(PositionGetSymbol(i) == _Symbol && PositionSelect(_Symbol))
+         {
+            double loss = PositionGetDouble(POSITION_PROFIT);
+            if(loss < -LossThresholdUSD)
+            {
+               OpenMartingaleOrder();
+               break;
+            }
+         }
       }
    }
 }
