@@ -1,0 +1,296 @@
+//+------------------------------------------------------------------+
+//|                                                   MartingaleEA.mq5|
+//|                        Copyright 2023, MetaQuotes Software Corp. |
+//|                                             https://www.mql5.com  |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2023, MetaQuotes Software Corp."
+#property link      "https://www.mql5.com"
+#property version   "1.16"
+
+//+------------------------------------------------------------------+
+//| Input parameters                                                |
+//+------------------------------------------------------------------+
+input bool    EnableStrategy     = true;      // Enable/disable the EA
+input double  InitialLot         = 0.01;      // Initial lot size per trade
+input int     CandleCount        = 2;         // Number of consecutive candles for entry (2 or 3)
+input double  FirstCloseProfit   = 0.5;       // Profit threshold to close the first trade (in account currency)
+input int     TriggerPoints      = 500;       // Adverse movement in points before opening a counter trade
+input int     MaxTrades          = 25;        // Maximum number of trades in a series
+input double  CounterCloseProfit = 1.0;       // Combined profit threshold to close counter trades (in account currency)
+input ulong   MagicNumber        = 987654;    // Identifier for EA trades
+input string  LotSequenceString  = "0.01,0.02,0.04,0.05,0.06,0.08,0.10,0.12,0.14,0.17,0.21,0.25,0.30,0.36,0.43,0.51,0.62,0.74,0.89,1.06,1.28,1.53,1.84,2.21,2.65,3.18,3.82";
+
+//+------------------------------------------------------------------+
+//| Global variables                                                |
+//+------------------------------------------------------------------+
+static double entryPrices[];
+static double positionSizes[];
+static double LotSequence[];
+static int    tradeCount            = 0;
+static bool   isBuyDirection        = true;
+static double startLot;
+static int    candleCountLocal;
+static int    triggerPtsLocal;
+static double firstCloseProfitLocal;
+static double counterCloseProfitLocal;
+static int    maxTradesLocal;
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                           |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   // Clamp inputs
+   candleCountLocal        = MathMax(MathMin(CandleCount,3),2);
+   triggerPtsLocal         = MathMax(TriggerPoints,1);
+   firstCloseProfitLocal   = MathMax(FirstCloseProfit,0.0);
+   counterCloseProfitLocal = MathMax(CounterCloseProfit,0.0);
+
+   // Normalize initial lot
+   startLot = NormalizeLot(InitialLot);
+   double minLot = SymbolInfoDouble(Symbol(),SYMBOL_VOLUME_MIN);
+   if(startLot < minLot)
+   {
+      Print(__FUNCTION__,": InitialLot adjusted to minimum ",DoubleToString(minLot,2));
+      startLot = minLot;
+   }
+
+   // Parse lot sequence string
+   string seq[];
+   int count = StringSplit(LotSequenceString,',',seq);
+   if(count < 1)
+   {
+      Print(__FUNCTION__,": parsing LotSequenceString failed, defaulting to startLot");
+      count = 1;
+      ArrayResize(LotSequence,1);
+      LotSequence[0] = startLot;
+   }
+   else
+   {
+      ArrayResize(LotSequence,count);
+      for(int i=0; i<count; i++)
+         LotSequence[i] = StringToDouble(seq[i]);
+   }
+   maxTradesLocal = MathMin(MaxTrades,ArraySize(LotSequence));
+
+   // Initialize tracking arrays
+   ArrayResize(entryPrices,   maxTradesLocal);
+   ArrayResize(positionSizes, maxTradesLocal);
+   ArrayInitialize(entryPrices,   0.0);
+   ArrayInitialize(positionSizes, 0.0);
+   tradeCount = 0;
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                            |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   if(!EnableStrategy) return;
+
+   // If no positions, reset series and look for initial entry
+   if(PositionsTotal() == 0)
+   {
+      tradeCount = 0;
+      if(CheckBuyCandlePattern())
+      {
+         isBuyDirection = true;
+         OpenInitialPosition();
+      }
+      else if(CheckSellCandlePattern())
+      {
+         isBuyDirection = false;
+         OpenInitialPosition();
+      }
+      return;
+   }
+
+   // Manage counter exits
+   ManageCounterClose();
+
+   // Add new counter if price moves against last entry
+   AddCounterEntry();
+}
+
+//+------------------------------------------------------------------+
+//| Check green-candle pattern (buy)                                 |
+//+------------------------------------------------------------------+
+bool CheckBuyCandlePattern()
+{
+   for(int i=1; i<=candleCountLocal; i++)
+      if(iHigh(NULL,PERIOD_M1,i-1)<=iHigh(NULL,PERIOD_M1,i) ||
+         iClose(NULL,PERIOD_M1,i-1)<=iOpen(NULL,PERIOD_M1,i-1))
+         return false;
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Check red-candle pattern (sell)                                 |
+//+------------------------------------------------------------------+
+bool CheckSellCandlePattern()
+{
+   for(int i=1; i<=candleCountLocal; i++)
+      if(iLow(NULL,PERIOD_M1,i-1)>=iLow(NULL,PERIOD_M1,i) ||
+         iClose(NULL,PERIOD_M1,i-1)>=iOpen(NULL,PERIOD_M1,i-1))
+         return false;
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Open initial trade with TP=FirstCloseProfit                      |
+//+------------------------------------------------------------------+
+void OpenInitialPosition()
+{
+   double vol = startLot;
+   double ask = SymbolInfoDouble(Symbol(),SYMBOL_ASK);
+   double bid = SymbolInfoDouble(Symbol(),SYMBOL_BID);
+   double price = isBuyDirection ? ask : bid;
+   // Calculate TP movement in price
+   double ticksNeeded = firstCloseProfitLocal / (SymbolInfoDouble(Symbol(),SYMBOL_TRADE_TICK_VALUE) * vol);
+   double priceMove = ticksNeeded * SymbolInfoDouble(Symbol(),SYMBOL_TRADE_TICK_SIZE);
+   double tp = isBuyDirection ? price + priceMove : price - priceMove;
+
+   MqlTradeRequest req; MqlTradeResult res;
+   ZeroMemory(req); ZeroMemory(res);
+   req.action    = TRADE_ACTION_DEAL;
+   req.symbol    = Symbol();
+   req.volume    = vol;
+   req.type      = isBuyDirection ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   req.price     = price;
+   req.tp        = tp;
+   req.deviation = 5;
+   req.magic     = MagicNumber;
+   if(OrderSend(req,res))
+   {
+      entryPrices[0]   = res.price;
+      positionSizes[0] = vol;
+      tradeCount       = 1;
+   }
+   else
+      Print(__FUNCTION__,": initial trade failed, error ",GetLastError());
+}
+
+//+------------------------------------------------------------------+
+//| Add counter trade when adverse movement                           |
+//+------------------------------------------------------------------+
+void AddCounterEntry()
+{
+   if(tradeCount >= maxTradesLocal) return;
+   double lastPx = entryPrices[tradeCount-1];
+   double curPx  = isBuyDirection
+                   ? SymbolInfoDouble(Symbol(),SYMBOL_BID)
+                   : SymbolInfoDouble(Symbol(),SYMBOL_ASK);
+   double deltaPts = MathAbs(lastPx - curPx) / _Point;
+   if(deltaPts >= triggerPtsLocal)
+   {
+      double lot = NormalizeLot(LotSequence[tradeCount]);
+      if(CheckMargin(lot))
+      {
+         OpenCounterPosition(lot, isBuyDirection);
+         tradeCount++;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Close all counter trades when combined profit reached            |
+//+------------------------------------------------------------------+
+void ManageCounterClose()
+{
+   if(tradeCount <= 1) return;
+   double totalProfit = 0.0;
+   for(int i=1; i<PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket>0 && PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+      {
+         double vol     = PositionGetDouble(POSITION_VOLUME);
+         double openPx  = PositionGetDouble(POSITION_PRICE_OPEN);
+         bool   isBuy   = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY;
+         double curPx   = isBuy
+                           ? SymbolInfoDouble(Symbol(),SYMBOL_BID)
+                           : SymbolInfoDouble(Symbol(),SYMBOL_ASK);
+         totalProfit += (isBuy ? (curPx - openPx) : (openPx - curPx))
+                        * vol
+                        * SymbolInfoDouble(Symbol(),SYMBOL_TRADE_TICK_VALUE)
+                        / SymbolInfoDouble(Symbol(),SYMBOL_TRADE_TICK_SIZE);
+      }
+   }
+   if(totalProfit >= counterCloseProfitLocal)
+   {
+      for(int i=PositionsTotal()-1; i>=1; i--)
+      {
+         ulong ticket = PositionGetTicket(i);
+         if(ticket>0 && PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+            ClosePosition(ticket);
+      }
+      tradeCount = 1; // keep first trade active for its TP
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Send a counter market order                                      |
+//+------------------------------------------------------------------+
+void OpenCounterPosition(double lot, bool isBuy)
+{
+   MqlTradeRequest req; MqlTradeResult res;
+   ZeroMemory(req); ZeroMemory(res);
+   req.action    = TRADE_ACTION_DEAL;
+   req.symbol    = Symbol();
+   req.volume    = lot;
+   req.type      = isBuy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   req.price     = isBuy
+                   ? SymbolInfoDouble(Symbol(),SYMBOL_ASK)
+                   : SymbolInfoDouble(Symbol(),SYMBOL_BID);
+   req.deviation = 5;
+   req.magic     = MagicNumber;
+   if(OrderSend(req,res))
+   {
+      entryPrices[tradeCount]   = res.price;
+      positionSizes[tradeCount] = lot;
+   }
+   else
+      Print(__FUNCTION__,": counter trade failed, error ",GetLastError());
+}
+
+//+------------------------------------------------------------------+
+//| Close a position by ticket                                       |
+//+------------------------------------------------------------------+
+void ClosePosition(ulong ticket)
+{
+   MqlTradeRequest req; MqlTradeResult res;
+   ZeroMemory(req); ZeroMemory(res);
+   req.action    = TRADE_ACTION_DEAL;
+   req.position  = ticket;
+   req.symbol    = Symbol();
+   req.volume    = PositionGetDouble(POSITION_VOLUME);
+   req.type      = ORDER_TYPE_SELL;
+   req.price     = SymbolInfoDouble(Symbol(),SYMBOL_BID);
+   req.deviation = 5;
+   req.magic     = MagicNumber;
+   OrderSend(req,res);
+}
+
+//+------------------------------------------------------------------+
+//| Check available margin                                           |
+//+------------------------------------------------------------------+
+bool CheckMargin(double lot)
+{
+   double required;
+   if(!OrderCalcMargin(ORDER_TYPE_BUY, Symbol(), lot,
+                       SymbolInfoDouble(Symbol(),SYMBOL_ASK), required))
+      return false;
+   return (required <= AccountInfoDouble(ACCOUNT_MARGIN_FREE));
+}
+
+//+------------------------------------------------------------------+
+//| Normalize lot size to broker increments                          |
+//+------------------------------------------------------------------+
+double NormalizeLot(double lot)
+{
+   double step = SymbolInfoDouble(Symbol(),SYMBOL_VOLUME_STEP);
+   double norm = step * MathFloor(lot/step + 0.5);
+   return MathMin(norm, SymbolInfoDouble(Symbol(),SYMBOL_VOLUME_MAX));
+}
+//+------------------------------------------------------------------+

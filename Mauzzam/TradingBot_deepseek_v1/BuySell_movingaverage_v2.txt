@@ -1,0 +1,145 @@
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+#include <Trade/Trade.mqh>
+#include <Indicators/Trend.mqh>
+
+input double LotSize = 0.1;          // Custom lot size
+input int MA_Period = 200;           // MA period
+input ENUM_MA_METHOD MA_Method = MODE_EMA;  // Using EMA
+input ENUM_TIMEFRAMES MA_Timeframe = PERIOD_M5; // Timeframe for MA
+input int ConsecutiveBars = 2;       // Number of consecutive higher/lower bars required
+input int SL_Buffer = 10;            // Points buffer for SL from EMA
+input int Entry_Buffer = 50;         // Points buffer to avoid entries near EMA (adjust as needed)
+
+CTrade trade;
+CiMA ma;
+int barsTotal;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   // Initialize MA indicator
+   if(!ma.Create(Symbol(), MA_Timeframe, MA_Period, 0, MA_Method, PRICE_CLOSE))
+   {
+      Print("Failed to create MA indicator");
+      return(INIT_FAILED);
+   }
+   
+   barsTotal = iBars(Symbol(), PERIOD_CURRENT);
+   
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   static datetime lastBarTime = 0;
+   datetime currentBarTime = iTime(Symbol(), PERIOD_CURRENT, 0);
+   
+   // Only check at new bar
+   if(lastBarTime == currentBarTime)
+      return;
+   lastBarTime = currentBarTime;
+   
+   // Update indicators
+   ma.Refresh(-1);
+   
+   // Get current price and MA value
+   double close1 = iClose(Symbol(), PERIOD_CURRENT, 1);
+   double close2 = iClose(Symbol(), PERIOD_CURRENT, 2);
+   double maValue = ma.Main(1);
+   double currentLow = iLow(Symbol(), PERIOD_CURRENT, 0);
+   double currentHigh = iHigh(Symbol(), PERIOD_CURRENT, 0);
+   double point = SymbolInfoDouble(Symbol(), SYMBOL_POINT);
+   int digits = (int)SymbolInfoInteger(Symbol(), SYMBOL_DIGITS);
+   
+   // Calculate distance from EMA in points
+   double distanceFromEMA = MathAbs(close1 - maValue) / point;
+   
+   // Check if we have open positions
+   if(PositionSelect(Symbol()))
+   {
+      ManageOpenPositions(maValue, currentLow, currentHigh, point, digits);
+      return;
+   }
+   
+   // Only consider entries if price is sufficiently far from EMA
+   if(distanceFromEMA < Entry_Buffer)
+      return;
+   
+   // Check for long conditions (price above MA)
+   if(close1 > maValue)
+   {
+      // Check for 2 consecutive higher highs
+      if(close1 > close2 && iHigh(Symbol(), PERIOD_CURRENT, 1) > iHigh(Symbol(), PERIOD_CURRENT, 2))
+      {
+         double sl = NormalizeDouble(maValue - (SL_Buffer * point), digits);
+         trade.Buy(LotSize, Symbol(), 0, sl, 0, "Long position");
+      }
+   }
+   // Check for short conditions (price below MA)
+   else if(close1 < maValue)
+   {
+      // Check for 2 consecutive lower lows
+      if(close1 < close2 && iLow(Symbol(), PERIOD_CURRENT, 1) < iLow(Symbol(), PERIOD_CURRENT, 2))
+      {
+         double sl = NormalizeDouble(maValue + (SL_Buffer * point), digits);
+         trade.Sell(LotSize, Symbol(), 0, sl, 0, "Short position");
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Manage open positions                                            |
+//+------------------------------------------------------------------+
+void ManageOpenPositions(double maValue, double currentLow, double currentHigh, double point, int digits)
+{
+   ulong ticket = PositionGetInteger(POSITION_TICKET);
+   bool isLong = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY;
+   
+   if(isLong)
+   {
+      // For long positions, close when price touches EMA from above
+      if(currentLow <= maValue)
+      {
+         trade.PositionClose(ticket);
+      }
+      else
+      {
+         // Update SL to stay just below EMA as it moves up
+         double newSl = NormalizeDouble(maValue - (SL_Buffer * point), digits);
+         double currentSl = PositionGetDouble(POSITION_SL);
+         
+         // Only move SL up (for long positions)
+         if(newSl > currentSl)
+         {
+            trade.PositionModify(ticket, newSl, 0);
+         }
+      }
+   }
+   else
+   {
+      // For short positions, close when price touches EMA from below
+      if(currentHigh >= maValue)
+      {
+         trade.PositionClose(ticket);
+      }
+      else
+      {
+         // Update SL to stay just above EMA as it moves down
+         double newSl = NormalizeDouble(maValue + (SL_Buffer * point), digits);
+         double currentSl = PositionGetDouble(POSITION_SL);
+         
+         // Only move SL down (for short positions)
+         if(newSl < currentSl)
+         {
+            trade.PositionModify(ticket, newSl, 0);
+         }
+      }
+   }
+}

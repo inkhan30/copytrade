@@ -1,0 +1,257 @@
+//+------------------------------------------------------------------+
+//|                                                      MartingaleEA.mq5 |
+//|                        Copyright 2023, MetaQuotes Software Corp. |
+//|                                             https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2023, MetaQuotes Software Corp."
+#property link      "https://www.mql5.com"
+#property version   "1.00"
+
+//+------------------------------------------------------------------+
+//| Input parameters                                                 |
+//+------------------------------------------------------------------+
+input bool   EnableStrategy = true;    // Enable Trading Strategy
+input double InitialLot     = 0.01;    // Initial Lot Size
+input int    TriggerPoints  = 500;     // Drop to Trigger Next Trade (points)
+input double ScalingFactor  = 2.0;     // Lot Size Scaling Factor
+input int    ProfitTarget   = 100;     // Profit Target (points)
+input int    MaxTrades      = 25;      // Maximum Trades
+input ulong  MagicNumber    = 987654;  // Expert Advisor Magic Number
+
+//+------------------------------------------------------------------+
+//| Global variables                                                 |
+//+------------------------------------------------------------------+
+double currentLot;
+int    tradeCount;
+double entryPrices[];
+double positionSizes[];
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   // Validate input parameters
+   if(!ParameterValidation())
+      return(INIT_PARAMETERS_INCORRECT);
+   
+   currentLot = InitialLot;
+   tradeCount = 0;
+   ArrayResize(entryPrices, MaxTrades);
+   ArrayResize(positionSizes, MaxTrades);
+   
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   if(!EnableStrategy) return;
+   
+   if(PositionsTotal() == 0)
+   {
+      OpenInitialPosition();
+      return;
+   }
+   
+   CheckForNewEntry();
+   CheckProfitTarget();
+}
+
+//+------------------------------------------------------------------+
+//| Parameter validation function                                    |
+//+------------------------------------------------------------------+
+bool ParameterValidation()
+{
+   if(InitialLot < SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MIN))
+   {
+      Alert("Initial lot size below minimum allowed");
+      return false;
+   }
+   
+   if(TriggerPoints <= 0 || ProfitTarget <= 0)
+   {
+      Alert("Invalid points value (must be > 0)");
+      return false;
+   }
+   
+   if(ScalingFactor < 1.0)
+   {
+      Alert("Scaling factor must be >= 1.0");
+      return false;
+   }
+   
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Open initial position                                            |
+//+------------------------------------------------------------------+
+void OpenInitialPosition()
+{
+   MqlTradeRequest request = {};
+   MqlTradeResult  result = {};
+   
+   request.action   = TRADE_ACTION_DEAL;
+   request.symbol   = Symbol();
+   request.volume   = InitialLot;
+   request.type     = ORDER_TYPE_BUY;
+   request.price    = SymbolInfoDouble(Symbol(), SYMBOL_ASK);
+   request.deviation= 5;
+   request.magic    = MagicNumber;
+   
+   if(!OrderSend(request, result))
+      Print("Initial order failed: ", GetLastError());
+   else
+   {
+      tradeCount = 1;
+      entryPrices[0] = result.price;
+      positionSizes[0] = InitialLot;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check conditions for new entry                                   |
+//+------------------------------------------------------------------+
+void CheckForNewEntry()
+{
+   if(tradeCount >= MaxTrades) return;
+   
+   double lastEntry = entryPrices[tradeCount-1];
+   double currentPrice = SymbolInfoDouble(Symbol(), SYMBOL_BID);
+   
+   // Calculate price drop in points
+   double dropPoints = (lastEntry - currentPrice) / Point();
+   
+   if(dropPoints >= TriggerPoints)
+   {
+      double newLot = NormalizeLot(currentLot * ScalingFactor);
+      
+      if(CheckMargin(newLot))
+      {
+         OpenHedgePosition(newLot);
+         currentLot = newLot;
+         tradeCount++;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Open hedge position                                              |
+//+------------------------------------------------------------------+
+void OpenHedgePosition(double lotSize)
+{
+   MqlTradeRequest request = {};
+   MqlTradeResult  result = {};
+   
+   request.action   = TRADE_ACTION_DEAL;
+   request.symbol   = Symbol();
+   request.volume   = lotSize;
+   request.type     = ORDER_TYPE_BUY;
+   request.price    = SymbolInfoDouble(Symbol(), SYMBOL_ASK);
+   request.deviation= 5;
+   request.magic    = MagicNumber;
+   
+   if(!OrderSend(request, result))
+      Print("Hedge order failed: ", GetLastError());
+   else
+   {
+      entryPrices[tradeCount] = result.price;
+      positionSizes[tradeCount] = lotSize;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check profit target conditions                                   |
+//+------------------------------------------------------------------+
+void CheckProfitTarget()
+{
+   double totalVolume = 0;
+   double weightedPrice = 0;
+   
+   for(int i = 0; i < tradeCount; i++)
+   {
+      weightedPrice += entryPrices[i] * positionSizes[i];
+      totalVolume += positionSizes[i];
+   }
+   
+   double averagePrice = weightedPrice / totalVolume;
+   double currentBid = SymbolInfoDouble(Symbol(), SYMBOL_BID);
+   
+   if((currentBid - averagePrice) >= ProfitTarget * Point())
+   {
+      CloseAllPositions();
+      ResetStrategy();
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Close all positions                                              |
+//+------------------------------------------------------------------+
+void CloseAllPositions()
+{
+   for(int i = PositionsTotal()-1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+      {
+         MqlTradeRequest request = {};
+         MqlTradeResult  result = {};
+         
+         request.action    = TRADE_ACTION_DEAL;
+         request.position  = ticket;
+         request.symbol    = Symbol();
+         request.volume    = PositionGetDouble(POSITION_VOLUME);
+         request.type      = ORDER_TYPE_SELL;
+         request.price     = SymbolInfoDouble(Symbol(), SYMBOL_BID);
+         request.deviation = 5;
+         request.magic     = MagicNumber;
+         
+         OrderSend(request, result);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Reset strategy parameters                                        |
+//+------------------------------------------------------------------+
+void ResetStrategy()
+{
+   tradeCount = 0;
+   currentLot = InitialLot;
+   ArrayInitialize(entryPrices, 0);
+   ArrayInitialize(positionSizes, 0);
+}
+
+//+------------------------------------------------------------------+
+//| Check margin requirements                                        |
+//+------------------------------------------------------------------+
+bool CheckMargin(double lotSize)
+{
+   double marginRequired;
+   if(!OrderCalcMargin(ORDER_TYPE_BUY, Symbol(), lotSize, SymbolInfoDouble(Symbol(), SYMBOL_ASK), marginRequired))
+   {
+      Print("Margin calculation failed");
+      return false;
+   }
+   
+   if(marginRequired > AccountInfoDouble(ACCOUNT_MARGIN_FREE))
+   {
+      Print("Insufficient margin for next trade");
+      return false;
+   }
+   
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Normalize lot size                                               |
+//+------------------------------------------------------------------+
+double NormalizeLot(double lot)
+{
+   double step = SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_STEP);
+   lot = step * floor(lot/step + 0.5);
+   return MathMin(lot, SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MAX));
+}
