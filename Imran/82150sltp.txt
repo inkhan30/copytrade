@@ -1,0 +1,161 @@
+//+------------------------------------------------------------------+
+//|                                               EMA_Crossover_EA.mq5 |
+//|                        Adapted for XAUUSD Trading                |
+//+------------------------------------------------------------------+
+#property copyright "OpenAI"
+#property version   "1.01"
+#property strict
+
+#include <Trade/Trade.mqh>
+CTrade trade;
+
+// Input parameters
+input double LotSize         = 0.1;
+input int EMA_Period1        = 8;
+input int EMA_Period2        = 21;
+input int EMA_Period3        = 50;
+input ENUM_TIMEFRAMES TimeFrame = PERIOD_CURRENT;
+
+input double StopLossPoints  = 500;   // SL in points
+input double TakeProfitPoints= 1000;  // TP in points
+input bool EnableTrailing    = true;
+input double TrailingStart   = 700;   // Start trailing after this profit in points
+input double TrailingStep    = 200;   // Trail distance in points
+
+// Indicator handles
+int emaHandle1, emaHandle2, emaHandle3;
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                            |
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   emaHandle1 = iMA(_Symbol, TimeFrame, EMA_Period1, 0, MODE_EMA, PRICE_CLOSE);
+   emaHandle2 = iMA(_Symbol, TimeFrame, EMA_Period2, 0, MODE_EMA, PRICE_CLOSE);
+   emaHandle3 = iMA(_Symbol, TimeFrame, EMA_Period3, 0, MODE_EMA, PRICE_CLOSE);
+
+   if(emaHandle1 == INVALID_HANDLE || emaHandle2 == INVALID_HANDLE || emaHandle3 == INVALID_HANDLE)
+     {
+      Print("Failed to create EMA handles");
+      return(INIT_FAILED);
+     }
+
+   return(INIT_SUCCEEDED);
+  }
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                          |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+  {
+   if(emaHandle1 != INVALID_HANDLE) IndicatorRelease(emaHandle1);
+   if(emaHandle2 != INVALID_HANDLE) IndicatorRelease(emaHandle2);
+   if(emaHandle3 != INVALID_HANDLE) IndicatorRelease(emaHandle3);
+  }
+
+//+------------------------------------------------------------------+
+//| Expert tick                                                      |
+//+------------------------------------------------------------------+
+void OnTick()
+  {
+   static datetime lastTime = 0;
+   MqlRates rates[];
+   if(CopyRates(_Symbol, TimeFrame, 0, 2, rates) <= 0) return;
+
+   datetime currentTime = rates[0].time;
+   if(currentTime == lastTime) return;
+   lastTime = currentTime;
+
+   double ema1[], ema2[], ema3[];
+   if(CopyBuffer(emaHandle1, 0, 0, 1, ema1) <= 0 ||
+      CopyBuffer(emaHandle2, 0, 0, 1, ema2) <= 0 ||
+      CopyBuffer(emaHandle3, 0, 0, 1, ema3) <= 0)
+     {
+      Print("Failed to retrieve EMA values");
+      return;
+     }
+
+   double emaVal1 = ema1[0];
+   double emaVal2 = ema2[0];
+   double emaVal3 = ema3[0];
+
+   bool hasPosition = PositionSelect(_Symbol);
+
+   // --- BUY Condition ---
+   if(emaVal1 > emaVal2 && emaVal2 > emaVal3)
+     {
+      if(!hasPosition || PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
+        {
+         if(hasPosition && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
+            trade.PositionClose(_Symbol);
+
+         double sl = SymbolInfoDouble(_Symbol, SYMBOL_BID) - StopLossPoints * _Point;
+         double tp = SymbolInfoDouble(_Symbol, SYMBOL_BID) + TakeProfitPoints * _Point;
+
+         trade.Buy(LotSize, _Symbol, SymbolInfoDouble(_Symbol, SYMBOL_ASK), sl, tp);
+         Print("Opened BUY position at price: ", SymbolInfoDouble(_Symbol, SYMBOL_ASK));
+        }
+     }
+   // --- SELL Condition ---
+   else if(emaVal1 < emaVal2 && emaVal2 < emaVal3)
+     {
+      if(!hasPosition || PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+        {
+         if(hasPosition && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+            trade.PositionClose(_Symbol);
+
+         double sl = SymbolInfoDouble(_Symbol, SYMBOL_ASK) + StopLossPoints * _Point;
+         double tp = SymbolInfoDouble(_Symbol, SYMBOL_ASK) - TakeProfitPoints * _Point;
+
+         trade.Sell(LotSize, _Symbol, SymbolInfoDouble(_Symbol, SYMBOL_BID), sl, tp);
+         Print("Opened SELL position at price: ", SymbolInfoDouble(_Symbol, SYMBOL_BID));
+        }
+     }
+   else if(hasPosition)
+     {
+      Print("Closed position due to no clear trend");
+      trade.PositionClose(_Symbol);
+     }
+
+   if(EnableTrailing)
+      ApplyTrailingStop();
+  }
+
+//+------------------------------------------------------------------+
+//| Trailing stop logic                                              |
+//+------------------------------------------------------------------+
+void ApplyTrailingStop()
+  {
+   if(!PositionSelect(_Symbol)) return;
+
+   double price = 0.0;
+   double stopLoss = 0.0;
+   double newSL = 0.0;
+   long type = PositionGetInteger(POSITION_TYPE);
+   double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+
+   if(type == POSITION_TYPE_BUY)
+     {
+      price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double profit = (price - openPrice) / _Point;
+      if(profit > TrailingStart)
+        {
+         newSL = price - TrailingStep * _Point;
+         stopLoss = PositionGetDouble(POSITION_SL);
+         if(newSL > stopLoss)
+            trade.PositionModify(_Symbol, newSL, PositionGetDouble(POSITION_TP));
+        }
+     }
+   else if(type == POSITION_TYPE_SELL)
+     {
+      price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double profit = (openPrice - price) / _Point;
+      if(profit > TrailingStart)
+        {
+         newSL = price + TrailingStep * _Point;
+         stopLoss = PositionGetDouble(POSITION_SL);
+         if(newSL < stopLoss || stopLoss == 0.0)
+            trade.PositionModify(_Symbol, newSL, PositionGetDouble(POSITION_TP));
+        }
+     }
+  }
