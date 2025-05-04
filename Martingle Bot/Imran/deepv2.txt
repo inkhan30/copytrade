@@ -1,0 +1,369 @@
+//+------------------------------------------------------------------+
+//|                                                      MartingaleEA.mq5 |
+//|                        Copyright 2023, MetaQuotes Software Corp. |
+//|                                             https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2023, MetaQuotes Software Corp."
+#property link      "https://www.mql5.com"
+#property version   "1.00"
+
+//+------------------------------------------------------------------+
+//| Input parameters                                                 |
+//+------------------------------------------------------------------+
+input bool   EnableStrategy        = true;     // Enable Trading Strategy
+input int    ConsecutiveCandles    = 2;        // Consecutive candles (2/3)
+input double InitialLot            = 0.01;     // Initial Lot Size
+input int    TriggerPoints         = 500;      // Points to trigger next trade
+input string LotSequence           = "0.01,0.02,0.04,0.05,0.06,0.08,0.10,0.12,0.14,0.17,0.21,0.25,0.30,0.36,0.43,0.51,0.62,0.74,0.89,1.06,1.28,1.53,1.84,2.21,2.65"; // Lot sequence
+input double ProfitTargetUSD       = 0.50;     // Take Profit in USD
+input double LossTriggerUSD        = -0.50;    // Loss to trigger next trade
+input int    MaxTrades             = 25;       // Maximum Trades
+input double MaxRiskPercent        = 5.0;      // Max Account Risk (%)
+input ulong  MagicNumber           = 987654;   // Expert Advisor Magic Number
+
+//+------------------------------------------------------------------+
+//| Global variables                                                 |
+//+------------------------------------------------------------------+
+double LotSequenceArray[];
+int    tradeCountBuy, tradeCountSell;
+double buyTPPoints, sellTPPoints;
+datetime lastTradeTime;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   if(!ParseLotSequence()) return(INIT_PARAMETERS_INCORRECT);
+   if(!ParameterValidation()) return(INIT_PARAMETERS_INCORRECT);
+   
+   tradeCountBuy = 0;
+   tradeCountSell = 0;
+   
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   if(!EnableStrategy) return;
+   
+   CheckEntrySignals();
+   ManageOpenPositions();
+}
+
+//+------------------------------------------------------------------+
+//| Parameter validation function                                    |
+//+------------------------------------------------------------------+
+bool ParameterValidation()
+{
+   if(ArraySize(LotSequenceArray) < 1)
+   {
+      Alert("Lot sequence is empty!");
+      return false;
+   }
+   
+   if(ConsecutiveCandles < 2 || ConsecutiveCandles > 3)
+   {
+      Alert("Consecutive candles must be 2 or 3");
+      return false;
+   }
+   
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Parse LotSequence string into array                              |
+//+------------------------------------------------------------------+
+bool ParseLotSequence()
+{
+   string values[];
+   int count = StringSplit(LotSequence, ',', values);
+   
+   if(count == 0)
+   {
+      Alert("Invalid LotSequence format");
+      return false;
+   }
+   
+   ArrayResize(LotSequenceArray, count);
+   
+   for(int i = 0; i < count; i++)
+   {
+      LotSequenceArray[i] = StringToDouble(values[i]);
+      if(LotSequenceArray[i] <= 0)
+      {
+         Alert("Invalid lot size in sequence at position ", i);
+         return false;
+      }
+   }
+   
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Check entry signals                                              |
+//+------------------------------------------------------------------+
+void CheckEntrySignals()
+{
+   if(PositionsTotal() == 0)
+   {
+      if(CheckBuySignal())
+         OpenPosition(ORDER_TYPE_BUY);
+      else if(CheckSellSignal())
+         OpenPosition(ORDER_TYPE_SELL);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check buy signal conditions                                      |
+//+------------------------------------------------------------------+
+bool CheckBuySignal()
+{
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   
+   if(CopyRates(Symbol(), PERIOD_M1, 0, ConsecutiveCandles+1, rates) < ConsecutiveCandles+1)
+      return false;
+
+   bool signal = true;
+   for(int i = 0; i < ConsecutiveCandles; i++)
+   {
+      if(rates[i].high <= rates[i+1].high)
+         signal = false;
+         
+      if(i < ConsecutiveCandles-1 && rates[i].close <= rates[i].open)
+         signal = false;
+   }
+   
+   return signal;
+}
+
+//+------------------------------------------------------------------+
+//| Check sell signal conditions                                     |
+//+------------------------------------------------------------------+
+bool CheckSellSignal()
+{
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   
+   if(CopyRates(Symbol(), PERIOD_M1, 0, ConsecutiveCandles+1, rates) < ConsecutiveCandles+1)
+      return false;
+
+   bool signal = true;
+   for(int i = 0; i < ConsecutiveCandles; i++)
+   {
+      if(rates[i].low >= rates[i+1].low)
+         signal = false;
+         
+      if(i < ConsecutiveCandles-1 && rates[i].close >= rates[i].open)
+         signal = false;
+   }
+   
+   return signal;
+}
+
+//+------------------------------------------------------------------+
+//| Open new position with dynamic TP                                |
+//+------------------------------------------------------------------+
+void OpenPosition(ENUM_ORDER_TYPE direction)
+{
+   int sequenceIndex = (direction == ORDER_TYPE_BUY) ? tradeCountBuy : tradeCountSell;
+   if(sequenceIndex >= MaxTrades) return;
+   
+   double lotSize = GetNextLotSize(direction);
+   lotSize = NormalizeLot(lotSize);
+   
+   if(!CheckMargin(lotSize, direction))
+   {
+      Print("Insufficient margin for ", EnumToString(direction), " position");
+      return;
+   }
+
+   MqlTradeRequest request = {};
+   MqlTradeResult result = {};
+   
+   request.action = TRADE_ACTION_DEAL;
+   request.symbol = Symbol();
+   request.volume = lotSize;
+   request.type = direction;
+   request.price = (direction == ORDER_TYPE_BUY) ? 
+                 SymbolInfoDouble(Symbol(), SYMBOL_ASK) : 
+                 SymbolInfoDouble(Symbol(), SYMBOL_BID);
+   
+   // Calculate TP for first trade in sequence
+   if(sequenceIndex == 0)
+   {
+      double tpPoints = CalculateTPPoints(direction, lotSize, ProfitTargetUSD);
+      if(direction == ORDER_TYPE_BUY)
+         buyTPPoints = tpPoints;
+      else
+         sellTPPoints = tpPoints;
+   }
+   
+   // Set TP based on sequence
+   double tpPoints = (direction == ORDER_TYPE_BUY) ? buyTPPoints : sellTPPoints;
+   request.tp = (direction == ORDER_TYPE_BUY) ? 
+                request.price + tpPoints * _Point : 
+                request.price - tpPoints * _Point;
+   
+   request.deviation = 5;
+   request.magic = MagicNumber;
+   
+   if(!OrderSend(request, result))
+   {
+      Print("Order failed: ", GetLastError());
+      return;
+   }
+   
+   if(direction == ORDER_TYPE_BUY)
+      tradeCountBuy++;
+   else
+      tradeCountSell++;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate TP points for target profit                            |
+//+------------------------------------------------------------------+
+double CalculateTPPoints(ENUM_ORDER_TYPE direction, double lotSize, double profitUSD)
+{
+   double tickValue = SymbolInfoDouble(Symbol(), SYMBOL_TRADE_TICK_VALUE);
+   double point = SymbolInfoDouble(Symbol(), SYMBOL_POINT);
+   
+   if(tickValue == 0 || point == 0) return 0;
+   
+   double points = profitUSD / (lotSize * tickValue * point);
+   return points;
+}
+
+//+------------------------------------------------------------------+
+//| Manage open positions                                            |
+//+------------------------------------------------------------------+
+void ManageOpenPositions()
+{
+   CheckIndividualProfits();
+   CheckLossTriggers();
+}
+
+//+------------------------------------------------------------------+
+//| Check individual profit targets                                  |
+//+------------------------------------------------------------------+
+void CheckIndividualProfits()
+{
+   for(int i = PositionsTotal()-1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+      {
+         double profit = PositionGetDouble(POSITION_PROFIT);
+         if(profit >= ProfitTargetUSD)
+         {
+            CloseSinglePosition(ticket);
+            ResetSequence((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE));
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check loss triggers for sequence continuation                    |
+//+------------------------------------------------------------------+
+void CheckLossTriggers()
+{
+   for(int i = PositionsTotal()-1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+      {
+         double profit = PositionGetDouble(POSITION_PROFIT);
+         ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+         int currentCount = (posType == POSITION_TYPE_BUY) ? tradeCountBuy : tradeCountSell;
+         
+         if(profit <= LossTriggerUSD && currentCount < MaxTrades)
+         {
+            OpenPosition((posType == POSITION_TYPE_BUY) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get next lot size in sequence                                    |
+//+------------------------------------------------------------------+
+double GetNextLotSize(ENUM_ORDER_TYPE direction)
+{
+   int sequenceIndex = (direction == ORDER_TYPE_BUY) ? tradeCountBuy : tradeCountSell;
+   if(sequenceIndex >= ArraySize(LotSequenceArray))
+      return LotSequenceArray[ArraySize(LotSequenceArray)-1];
+   
+   return LotSequenceArray[sequenceIndex];
+}
+
+//+------------------------------------------------------------------+
+//| Close single position                                            |
+//+------------------------------------------------------------------+
+void CloseSinglePosition(ulong ticket)
+{
+   MqlTradeRequest request = {};
+   MqlTradeResult result = {};
+   
+   PositionSelectByTicket(ticket);
+   
+   request.action = TRADE_ACTION_DEAL;
+   request.position = ticket;
+   request.symbol = Symbol();
+   request.volume = PositionGetDouble(POSITION_VOLUME);
+   request.type = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? 
+                ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+   request.price = (request.type == ORDER_TYPE_SELL) ? 
+                 SymbolInfoDouble(Symbol(), SYMBOL_BID) : 
+                 SymbolInfoDouble(Symbol(), SYMBOL_ASK);
+   request.deviation = 5;
+   
+   if(!OrderSend(request, result))
+      Print("Close position failed: ", GetLastError());
+}
+
+//+------------------------------------------------------------------+
+//| Reset trade sequence                                             |
+//+------------------------------------------------------------------+
+void ResetSequence(ENUM_POSITION_TYPE direction)
+{
+   if(direction == POSITION_TYPE_BUY)
+      tradeCountBuy = 0;
+   else
+      tradeCountSell = 0;
+}
+
+//+------------------------------------------------------------------+
+//| Margin check                                                     |
+//+------------------------------------------------------------------+
+bool CheckMargin(double lotSize, ENUM_ORDER_TYPE direction)
+{
+   double marginRequired;
+   if(!OrderCalcMargin(ENUM_ORDER_TYPE(direction), Symbol(), lotSize, 
+                      SymbolInfoDouble(Symbol(), (direction == ORDER_TYPE_BUY) ? SYMBOL_ASK : SYMBOL_BID), 
+                      marginRequired))
+   {
+      Print("Margin calculation error");
+      return false;
+   }
+   
+   double accountEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double riskPercentage = (marginRequired / accountEquity) * 100;
+   
+   return (riskPercentage <= MaxRiskPercent);
+}
+
+//+------------------------------------------------------------------+
+//| Normalize lot size                                               |
+//+------------------------------------------------------------------+
+double NormalizeLot(double lot)
+{
+   double step = SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_STEP);
+   lot = step * floor(lot/step + 0.5);
+   return MathMin(MathMax(lot, SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MIN)),
+                 SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MAX));
+}
