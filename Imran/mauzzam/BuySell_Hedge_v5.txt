@@ -4,9 +4,9 @@ CTrade trade;
 
 // Input parameters
 input double LotSize = 0.01;              // Base lot size
-input ulong StopLossPoints = 5000;        // Initial Stop Loss in points
+input ulong StopLossPoints = 8500;        // Initial Stop Loss in points
 input ulong ProfitStepPoints = 1200;      // Profit Step in points
-input int ConsecutiveBars = 3;            // Number of consecutive bars for trend confirmation
+input int ConsecutiveBars = 2;            // Number of consecutive bars for trend confirmation
 input bool EnableHedging = true;          // Enable/Disable hedging feature
 input double HedgeMultiplier = 2.0;       // Lot size multiplier for hedge trades
 
@@ -39,8 +39,8 @@ bool CheckBuySignal()
 {
     MqlRates rates[4];
     if(CopyRates(_Symbol, _Period, 0, 4, rates) != 4) return false;
-    
-    // Check for 3 consecutive bullish candles
+
+    // Check for consecutive bullish candles
     for(int i = 1; i <= ConsecutiveBars; i++)
     {
         if(rates[i].close <= rates[i-1].close) return false;
@@ -52,8 +52,8 @@ bool CheckSellSignal()
 {
     MqlRates rates[4];
     if(CopyRates(_Symbol, _Period, 0, 4, rates) != 4) return false;
-    
-    // Check for 3 consecutive bearish candles
+
+    // Check for consecutive bearish candles
     for(int i = 1; i <= ConsecutiveBars; i++)
     {
         if(rates[i].close >= rates[i-1].close) return false;
@@ -64,7 +64,7 @@ bool CheckSellSignal()
 void ManageTrades()
 {
     bool positionExists = PositionSelect(_Symbol);
-    
+
     if(!positionExists)
     {
         hedgeOpened = false; // Reset flag when no positions exist
@@ -98,19 +98,17 @@ void CheckHedgeCondition()
     double currentPrice = type == POSITION_TYPE_BUY ? 
                         SymbolInfoDouble(_Symbol, SYMBOL_BID) : 
                         SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-    
-    // Calculate 50% of SL distance
+
     double halfSLDistance = StopLossPoints * _Point / 2.0;
-    
+
     if(type == POSITION_TYPE_BUY)
     {
         if(currentPrice <= (entryPrice - halfSLDistance))
         {
-            // Open hedge sell trade with double lot size and half SL (no TP)
             double hedgeLotSize = LotSize * HedgeMultiplier;
             double hedgeSL = currentPrice + (StopLossPoints * _Point / 2.0);
             double hedgeTP = currentPrice + (StopLossPoints * _Point);
-            
+
             if(trade.Sell(hedgeLotSize, _Symbol, currentPrice, hedgeSL, hedgeTP, "Hedge Sell Trade"))
             {
                 hedgeOpened = true;
@@ -123,11 +121,10 @@ void CheckHedgeCondition()
     {
         if(currentPrice >= (entryPrice + halfSLDistance))
         {
-            // Open hedge buy trade with double lot size and half SL (no TP)
             double hedgeLotSize = LotSize * HedgeMultiplier;
             double hedgeSL = currentPrice - (StopLossPoints * _Point / 2.0);
-            double hedgeTP = currentPrice + (StopLossPoints * _Point);
-            
+            double hedgeTP = currentPrice - (StopLossPoints * _Point);
+
             if(trade.Buy(hedgeLotSize, _Symbol, currentPrice, hedgeSL, hedgeTP, "Hedge Buy Trade"))
             {
                 hedgeOpened = true;
@@ -142,13 +139,11 @@ void CheckBreakEvenAndClose()
 {
     if(!hedgeOpened || PositionsTotal() != 2) return;
 
-    // Get both positions
     PositionSelect(_Symbol);
     long type1 = PositionGetInteger(POSITION_TYPE);
     double profit1 = PositionGetDouble(POSITION_PROFIT);
     double volume1 = PositionGetDouble(POSITION_VOLUME);
-    
-    // Select the other position
+
     for(int i = 0; i < PositionsTotal(); i++)
     {
         ulong ticket = PositionGetTicket(i);
@@ -158,11 +153,9 @@ void CheckBreakEvenAndClose()
             long type2 = PositionGetInteger(POSITION_TYPE);
             double profit2 = PositionGetDouble(POSITION_PROFIT);
             double volume2 = PositionGetDouble(POSITION_VOLUME);
-            
-            // Check if positions are opposite and total profit is >= 0
+
             if(type1 != type2 && (profit1 + profit2) >= 0)
             {
-                // Close both positions
                 trade.PositionClose(PositionGetInteger(POSITION_TICKET));
                 trade.PositionClose(ticket);
                 hedgeOpened = false;
@@ -181,10 +174,10 @@ void CheckAndAdjustTPSL()
     double price = type == POSITION_TYPE_BUY ? 
                  SymbolInfoDouble(_Symbol, SYMBOL_ASK) : 
                  SymbolInfoDouble(_Symbol, SYMBOL_BID);
-    
+
     double step = ProfitStepPoints * _Point;
 
-    if(!hedgeOpened) // Only adjust TP/SL if not in hedge mode
+    if(!hedgeOpened)
     {
         if(type == POSITION_TYPE_BUY)
         {
@@ -237,7 +230,7 @@ void OnTick()
             ManageTrades();
         }
     }
-    
+
     CheckAndAdjustTPSL();
     CheckHedgeCondition();
     CheckBreakEvenAndClose();
