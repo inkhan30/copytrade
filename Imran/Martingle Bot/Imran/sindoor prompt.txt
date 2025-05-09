@@ -1,0 +1,51 @@
+You are tasked with modifying an existing trading strategy code to implement a new feature related to counter trade stop loss (SL) and opening trades.
+
+Specifically:
+- When the counter trade reaches the stop loss (SL), immediately open a new trade.
+- The new trade's parameters (stop loss in pips, trade value, maximum allowed trades, and trade direction) should be defined by the user.
+- The strategy should open trades only up to the maximum number of trades specified by the user.
+- All other existing functionality and code should remain unchanged.
+
+Please incorporate this feature clearly into the current strategy code, ensuring proper handling of user input parameters for:
+- Stop loss in pips
+- Trade value
+- Maximum number of trades
+- Direction of the trade
+
+Include adequate comments to explain the new implementation and preserve the original code structure and logic apart from the added feature.
+
+# Steps
+1. Detect when counter trade hits stop loss.
+2. Check if the current number of trades is less than the user-defined maximum trades.
+3. Open a new trade using the user-defined stop loss pips, trade value, and direction.
+4. Keep the rest of the code and existing logic intact.
+
+# Output Format
+Provide the modified code snippet implementing the described feature with inline comments explaining the changes.
+
+
+
+
+
+
+
+
+
+Revise the instruction "Diroction for counter re-entries" so that its guidance matches exactly the same as the guidance provided for "counter trade." Carefully compare the existing instructions for both terms and update the text for counter re-entries to be consistent with and identical in approach to the instructions for counter trade.
+
+# Steps
+
+1. Identify the current instructions for "counter trade."  
+2. Identify the current instructions for "counter re-entries."  
+3. Analyze the differences between both instructions.  
+4. Rewrite or modify the instruction for "counter re-entries" so it matches exactly that of "counter trade."  
+
+# Output Format
+
+Provide the revised instruction text for "counter re-entries." If possible, include the original "counter trade" instruction for reference.
+
+# Notes
+
+- Ensure spelling and wording reflect the intended meaning precisely.
+- Maintain clarity and consistency between both instructions.
+- If no existing text is available, state that explicitly and request further input.
