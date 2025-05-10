@@ -1,0 +1,246 @@
+//+------------------------------------------------------------------+
+//|                                  EnhancedMartingaleEA.mq5        |
+//|                        Copyright 2023, YourNameHere              |
+//|                                             https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2023, YourNameHere"
+#property link      "https://www.mql5.com"
+#property version   "1.20"
+
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+
+//+------------------------------------------------------------------+
+//| Input Parameters                                                 |
+//+------------------------------------------------------------------+
+input bool   EnableStrategy       = true;        // Enable Strategy
+input int    ConsecutiveCandles   = 2;           // Consecutive Candles for Entry
+input double InitialLotSize       = 0.01;        // Initial Lot Size
+input int    InitialTPPoints      = 100;         // Initial Take-Profit (Points)
+input string CustomLotSequence    = "0.01,0.02,0.04,0.08,0.16"; // Hedge Lot Sizes
+input int    TriggerPoints        = 500;         // Points to Trigger Hedge
+input int    ProfitTargetPoints   = 100;         // Profit Target (Points)
+input int    MaxLossPoints        = 2000;        // Max Loss (Points) - Emergency Stop
+input int    MaxTrades            = 10;          // Maximum Trades
+input ulong  MagicNumber          = 987654;      // Magic Number
+
+//+------------------------------------------------------------------+
+//| Global Variables                                                 |
+//+------------------------------------------------------------------+
+CTrade   trade;
+int      tradeCount = 0;
+double   entryPrices[];
+double   positionSizes[];
+int      tradeTypes[];
+double   customLots[];
+double   symbolPoint;
+//+------------------------------------------------------------------+
+//| Expert Initialization Function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+  // Validate inputs
+  if(ConsecutiveCandles < 1 || TriggerPoints <= 0 || ProfitTargetPoints <= 0 || MaxTrades < 1)
+  {
+    Alert("Invalid input parameters!");
+    return(INIT_PARAMETERS_INCORRECT);
+  }
+  
+  symbolPoint = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+  
+  // Parse lot sequence
+  if(!ParseLotSequence())
+  {
+    Alert("Failed to parse lot sequence!");
+    return(INIT_FAILED);
+  }
+
+  trade.SetExpertMagicNumber(MagicNumber);
+  trade.SetDeviationInPoints(10);
+  
+  ArrayResize(entryPrices, MaxTrades);
+  ArrayResize(positionSizes, MaxTrades);
+  ArrayResize(tradeTypes, MaxTrades);
+  
+  return(INIT_SUCCEEDED);
+}
+//+------------------------------------------------------------------+
+//| Expert Tick Function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+  if(!EnableStrategy) return;
+  
+  if(tradeCount == 0)
+  {
+    CheckInitialEntry();
+  }
+  else
+  {
+    CheckForNewEntry();
+    CheckProfitTarget();
+    CheckEmergencyStop();
+  }
+}
+//+------------------------------------------------------------------+
+//| Initial Trade Based on Candle Pattern                            |
+//+------------------------------------------------------------------+
+void CheckInitialEntry()
+{
+  if(iBars(_Symbol, PERIOD_CURRENT) < ConsecutiveCandles + 1) return;
+  
+  bool bullish = true, bearish = true;
+  for(int i=1; i<=ConsecutiveCandles; i++)
+  {
+    double open = iOpen(_Symbol, PERIOD_CURRENT, i);
+    double close = iClose(_Symbol, PERIOD_CURRENT, i);
+    if(close <= open) bullish = false;
+    if(close >= open) bearish = false;
+  }
+  
+  if(!bullish && !bearish) return;
+  
+  ENUM_ORDER_TYPE type = bullish ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+  double price = type == ORDER_TYPE_BUY ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) 
+                                      : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+  double tpPrice = type == ORDER_TYPE_BUY ? price + InitialTPPoints * symbolPoint 
+                                        : price - InitialTPPoints * symbolPoint;
+  
+  if(trade.PositionOpen(_Symbol, type, NormalizeLot(InitialLotSize), price, 0, tpPrice, ""))
+  {
+    entryPrices[0] = price;
+    positionSizes[0] = InitialLotSize;
+    tradeTypes[0] = type;
+    tradeCount = 1;
+    Print("Initial ", EnumToString(type), " opened at ", price);
+  }
+}
+//+------------------------------------------------------------------+
+//| Check for Hedge Opportunities                                    |
+//+------------------------------------------------------------------+
+void CheckForNewEntry()
+{
+  if(tradeCount >= MaxTrades) return;
+  
+  int direction = tradeTypes[0];
+  double lastPrice = entryPrices[tradeCount-1];
+  double currentPrice = direction == ORDER_TYPE_BUY ? SymbolInfoDouble(_Symbol, SYMBOL_BID) 
+                                                  : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+  
+  double priceMove = MathAbs(lastPrice - currentPrice) / symbolPoint;
+  
+  if(priceMove >= TriggerPoints)
+  {
+    double newPrice = direction == ORDER_TYPE_BUY ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) 
+                                                : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double lotSize = customLots[tradeCount-1]; // Corrected index
+    
+    if(trade.PositionOpen(_Symbol, (ENUM_ORDER_TYPE)direction, NormalizeLot(lotSize), newPrice, 0, 0, ""))
+    {
+      entryPrices[tradeCount] = newPrice;
+      positionSizes[tradeCount] = lotSize;
+      tradeTypes[tradeCount] = direction;
+      tradeCount++;
+      Print("Hedge #", tradeCount, " opened at ", newPrice);
+    }
+  }
+}
+//+------------------------------------------------------------------+
+//| Check Profit Target                                              |
+//+------------------------------------------------------------------+
+void CheckProfitTarget()
+{
+  double totalProfit = 0;
+  
+  for(int i=0; i<tradeCount; i++)
+  {
+    double currentPrice = tradeTypes[i] == ORDER_TYPE_BUY ? SymbolInfoDouble(_Symbol, SYMBOL_BID) 
+                                                        : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double profit = (currentPrice - entryPrices[i]) * (tradeTypes[i] == ORDER_TYPE_BUY ? 1 : -1);
+    totalProfit += profit * positionSizes[i] / symbolPoint;
+  }
+  
+  if(totalProfit >= ProfitTargetPoints)
+  {
+    CloseAllPositions();
+    Print("Profit target reached. All positions closed.");
+  }
+}
+//+------------------------------------------------------------------+
+//| Emergency Stop Loss                                              |
+//+------------------------------------------------------------------+
+void CheckEmergencyStop()
+{
+  double totalLoss = 0;
+  
+  for(int i=0; i<tradeCount; i++)
+  {
+    double currentPrice = tradeTypes[i] == ORDER_TYPE_BUY ? SymbolInfoDouble(_Symbol, SYMBOL_BID) 
+                                                        : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double loss = (entryPrices[i] - currentPrice) * (tradeTypes[i] == ORDER_TYPE_BUY ? 1 : -1);
+    totalLoss += loss * positionSizes[i] / symbolPoint;
+  }
+  
+  if(totalLoss >= MaxLossPoints)
+  {
+    CloseAllPositions();
+    Print("Emergency stop loss triggered!");
+  }
+}
+//+------------------------------------------------------------------+
+//| Close All Positions                                              |
+//+------------------------------------------------------------------+
+void CloseAllPositions()
+{
+  for(int i=PositionsTotal()-1; i>=0; i--)
+  {
+    ulong ticket = PositionGetTicket(i);
+    if(PositionSelectByTicket(ticket) && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+    {
+      trade.PositionClose(ticket);
+    }
+  }
+  tradeCount = 0;
+  Print("All positions closed");
+}
+//+------------------------------------------------------------------+
+//| Parse Custom Lot Sequence                                        |
+//+------------------------------------------------------------------+
+bool ParseLotSequence()
+{
+  string parts[];
+  int count = StringSplit(CustomLotSequence, ',', parts);
+  
+  if(count != MaxTrades)
+  {
+    Alert("Lot sequence requires ", MaxTrades, " values");
+    return false;
+  }
+  
+  ArrayResize(customLots, MaxTrades);
+  
+  for(int i=0; i<MaxTrades; i++)
+  {
+    double lot = StringToDouble(parts[i]);
+    if(lot <= 0)
+    {
+      Alert("Invalid lot size at position ", i+1);
+      return false;
+    }
+    customLots[i] = NormalizeLot(lot);
+  }
+  return true;
+}
+//+------------------------------------------------------------------+
+//| Normalize Lot Size                                               |
+//+------------------------------------------------------------------+
+double NormalizeLot(double lot)
+{
+  double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+  double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+  double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+  
+  lot = MathRound(lot/step)*step;
+  return MathMin(MathMax(lot, minLot), maxLot);
+}
+//+------------------------------------------------------------------+

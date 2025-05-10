@@ -21,9 +21,9 @@
 //+------------------------------------------------------------------+
  input bool   EnableStrategy       = true;                                       // Enable strategy on/off
  input int    ConsecutiveCandles   = 2;                                          // Number of consecutive candles for initial entry
- input double InitialLotSize       = 0.01;                                       // <-- New: lot size for the very first trade
- input int    InitialTPPoints      = 100;                                        // <-- New: take‑profit for the initial trade, in points
- input string CustomLotSequence    = "0.01,0.02,0.04,0.05,0.06,0.08,0.10,0.12,0.14,0.17,0.21,0.25,0.30,0.36,0.43,0.51,0.62,0.74,0.89,1.06,1.28,1.53,1.84,2.21,2.65"; // Lot sizes per trade
+ input double InitialLotSize       = 0.10;                                       // <-- New: lot size for the very first trade
+ input int    InitialTPPoints      = 100;                                        // <-- New: take?profit for the initial trade, in points
+ input string CustomLotSequence    = "0.10,0.20,0.40,0.50,0.60,0.80,1,1.20,1.40,1.60,1.8,2,2.2,2.4,2.6,2.8,3,3.2,3.4,3.6,3.8,4,4.2,4.4,4.6"; // Lot sizes per trade
  input int    TriggerPoints        = 500;                                         // Points move to trigger next hedge (50 pips = 500 points)
  input int    ProfitTargetPoints   = 100;                                         // Combined profit target in points (10 pips = 100 points)
  input int    MaxTrades            = 25;                                          // Maximum number of hedges
@@ -66,8 +66,8 @@ void CheckInitialEntry()
                     ? price + InitialTPPoints * _Point
                     : price - InitialTPPoints * _Point);
 
-  // open the initial trade using the new user‑defined lot and TP
-  if(trade.PositionOpen(Symbol(), type, 0.01, price, 0, tpPrice, ""))
+  // open the initial trade using the new user?defined lot and TP
+  if(trade.PositionOpen(Symbol(), type, InitialLotSize, price, 0, tpPrice, ""))
   {
     tradeCount = 1;
     entryPrices[0]   = price;
@@ -81,8 +81,17 @@ void CheckInitialEntry()
 //+------------------------------------------------------------------+
 int OnInit()
 {
-  if(!ValidateParameters() || !ParseLotSequence())
+  if(!ValidateParameters())
+  {
+    Print("Parameter validation failed.");
     return(INIT_PARAMETERS_INCORRECT);
+  }
+
+  if(!ParseLotSequence())
+  {
+    Print("Lot sequence parsing failed.");
+    return(INIT_PARAMETERS_INCORRECT);
+  }
 
   trade.SetExpertMagicNumber(MagicNumber);
   trade.SetDeviationInPoints(5);
@@ -91,6 +100,7 @@ int OnInit()
   ArrayResize(entryPrices,  MaxTrades);
   ArrayResize(positionSizes,MaxTrades);
   ArrayResize(tradeTypes,   MaxTrades);
+
   return(INIT_SUCCEEDED);
 }
 

@@ -1,0 +1,36 @@
+Strategy Overview
+Initial Entry Condition:
+
+The EA opens the first trade when ConsecutiveCandles (e.g., 2) consecutive bullish (up) or bearish (down) candles are detected.
+
+The initial trade uses a user-defined InitialLotSize and a take-profit (InitialTPPoints).
+
+Hedging Mechanism:
+
+If the price moves against the initial trade by TriggerPoints (e.g., 500 points), the EA opens additional positions ("hedges") in the same direction as the initial trade.
+
+The lot sizes for hedges follow a user-defined sequence (CustomLotSequence), parsed into an array.
+
+Profit Target:
+
+All positions are closed when the combined unrealized profit reaches ProfitTargetPoints (e.g., 100 points).
+
+Risk Management:
+
+The EA stops opening new trades after MaxTrades (e.g., 25) positions are reached.
+
+No stop-loss is implemented; reliance is on the profit target.
+
+
+Key Input Parameters
+Parameter	Description
+EnableStrategy	Enables/disables the strategy.
+ConsecutiveCandles	Number of consecutive candles to trigger the initial trade.
+InitialLotSize	Lot size for the first trade.
+InitialTPPoints	Take-profit distance (in points) for the initial trade.
+CustomLotSequence	Comma-separated lot sizes for subsequent hedges.
+TriggerPoints	Points the price must move against the position to trigger a new hedge.
+ProfitTargetPoints	Combined profit (points) to close all trades.
+MaxTrades	Maximum number of trades (initial + hedges).
+MagicNumber	Unique identifier for EA-managed trades.
+
