@@ -6,11 +6,11 @@ input bool     EnableVolumeFilter  = true;        // New: Enable/Disable volume 
 input int      VolumeThreshold     = 5000;        // New: Max tick volume to allow trading
 input int      ConsecutiveCandles  = 2;
 input double   InitialLotSize      = 0.01;
-input int      InitialTPPips       = 10;          // Take profit in pips
-input string   CustomLotSequence   = "0.02,0.03,0.05";
+input int      InitialTPPips       = 10;          // Take profit in pips for initial trade
+input string   CustomLotSequence   = "0.02,0.04,0.05,0.06,0.08,0.10,0.12,0.14,0.17,0.21,0.25,0.30,0.36,0.43,0.51,0.62,0.74,0.89,1.06,1.28,1.53,1.84,2.21,2.65,2.90,3.25,3.65,3.95,4.3,4.65";
 input int      TriggerPips         = 50;          // Distance to trigger hedge in pips
 input int      ProfitTargetPips    = 10;          // Total profit target in pips
-input int      MaxTrades           = 25;
+input int      MaxTrades           = 30;
 input int      MagicNumber         = 123456;
 
 #include <Trade\Trade.mqh>
@@ -62,10 +62,10 @@ void OnTick()
       {
          initialTradeOpened = true;
          initialPrice = SymbolInfoDouble(_Symbol, direction == 1 ? SYMBOL_ASK : SYMBOL_BID);
+         double tp_price = initialPrice + (direction == 1 ? InitialTPPips : -InitialTPPips) * PIP * _Point;
          trade.SetExpertMagicNumber(MagicNumber);
          trade.PositionOpen(_Symbol, direction == 1 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,
-                            InitialLotSize, initialPrice,
-                            0, initialPrice + (direction == 1 ? InitialTPPips : -InitialTPPips) * PIP * _Point);
+                            InitialLotSize, initialPrice, 0, tp_price);
       }
    }
    else if (totalTrades < MaxTrades)
@@ -86,10 +86,10 @@ void OnTick()
 //+------------------------------------------------------------------+
 bool IsHighVolume()
 {
-   long tick_volume;
-   if (!CopyTickVolume(_Symbol, _Period, 0, 1, &tick_volume))
+   long tick_volume_array[1];
+   if (CopyTickVolume(_Symbol, _Period, 0, 1, tick_volume_array) != 1)
       return false;
-   return tick_volume >= VolumeThreshold;
+   return tick_volume_array[0] >= VolumeThreshold;
 }
 
 //+------------------------------------------------------------------+

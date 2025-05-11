@@ -17,11 +17,11 @@ input bool   EnableStrategy       = true;        // Enable Strategy
 input int    ConsecutiveCandles   = 2;           // Consecutive Candles for Entry
 input double InitialLotSize       = 0.01;        // Initial Lot Size
 input int    InitialTPPoints      = 100;         // Initial Take-Profit (Points)
-input string CustomLotSequence    = "0.01,0.02,0.04,0.08,0.16"; // Hedge Lot Sizes
+input string CustomLotSequence    = "0.02,0.04,0.05,0.06,0.08,0.10,0.12,0.14,0.17,0.21,0.25,0.30,0.36,0.43,0.51,0.62,0.74,0.89,1.06,1.28,1.53,1.84,2.21,2.65,2.90,3.25,3.65,3.95,4.3,4.65"; // Hedge Lot Sizes
 input int    TriggerPoints        = 500;         // Points to Trigger Hedge
 input int    ProfitTargetPoints   = 100;         // Profit Target (Points)
 input int    MaxLossPoints        = 2000;        // Max Loss (Points) - Emergency Stop
-input int    MaxTrades            = 10;          // Maximum Trades
+input int    MaxTrades            = 30;          // Maximum Trades
 input ulong  MagicNumber          = 987654;      // Magic Number
 
 //+------------------------------------------------------------------+

@@ -16,7 +16,6 @@ CTrade trade;
 
 int direction = 0; // 1 for Buy, -1 for Sell
 bool initialTradeOpened = false;
-double initialPrice = 0;
 double lotSequence[];
 #define PIP 10
 
@@ -56,8 +55,9 @@ void OnTick()
       if (CheckConsecutiveCandles(direction))
       {
          initialTradeOpened = true;
-         initialPrice = SymbolInfoDouble(_Symbol, direction == 1 ? SYMBOL_ASK : SYMBOL_BID);
+         double initialPrice = SymbolInfoDouble(_Symbol, direction == 1 ? SYMBOL_ASK : SYMBOL_BID);
          trade.SetExpertMagicNumber(MagicNumber);
+         Print("First Trade");
          trade.PositionOpen(_Symbol, direction == 1 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,
                             InitialLotSize, initialPrice,
                             0,
@@ -85,7 +85,9 @@ int CountOpenTrades()
    int count = 0;
    for (int i = PositionsTotal() - 1; i >= 0; i--)
    {
-      if (PositionGetTicket(i) > 0 && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if (PositionGetInteger(POSITION_MAGIC) == MagicNumber)
          count++;
    }
    return count;
@@ -120,14 +122,32 @@ bool CheckConsecutiveCandles(int &dir)
 //+------------------------------------------------------------------+
 void ManageHedging()
 {
+   double lastPrice = GetLastPositionPrice();
+   if(lastPrice == 0) return;
+
    double currentPrice = SymbolInfoDouble(_Symbol, direction == 1 ? SYMBOL_ASK : SYMBOL_BID);
-   double distance = MathAbs(currentPrice - initialPrice);
    int openCount = CountOpenTrades();
 
-   if (distance >= TriggerPips * PIP * _Point && openCount < ArraySize(lotSequence) + 1)
+   // Calculate required trigger distance based on direction
+   double triggerDistance = TriggerPips * PIP * _Point;
+   bool conditionMet = false;
+
+   if(direction == 1) // Initial direction: Buy
+   {
+      // For Buy, hedge when price moves DOWN by TriggerPips from last position
+      conditionMet = (currentPrice <= lastPrice - triggerDistance);
+   }
+   else if(direction == -1) // Initial direction: Sell
+   {
+      // For Sell, hedge when price moves UP by TriggerPips from last position
+      conditionMet = (currentPrice >= lastPrice + triggerDistance);
+   }
+
+   if(conditionMet && openCount < ArraySize(lotSequence) + 1)
    {
       double lot = lotSequence[openCount - 1];
       trade.SetExpertMagicNumber(MagicNumber);
+      Print("Hedge Trade: Lot=", lot, " at ", currentPrice);
       trade.PositionOpen(_Symbol, direction == 1 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,
                          lot, currentPrice, 0, 0);
    }
@@ -141,7 +161,9 @@ double GetTotalUnrealizedProfit()
    double profit = 0;
    for (int i = PositionsTotal() - 1; i >= 0; i--)
    {
-      if (PositionGetTicket(i) > 0 && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if (PositionGetInteger(POSITION_MAGIC) == MagicNumber)
          profit += PositionGetDouble(POSITION_PROFIT);
    }
    return profit;
@@ -154,10 +176,34 @@ void CloseAllTrades()
 {
    for (int i = PositionsTotal() - 1; i >= 0; i--)
    {
-      if (PositionGetTicket(i) > 0 && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if (PositionGetInteger(POSITION_MAGIC) == MagicNumber)
       {
          string symbol = PositionGetString(POSITION_SYMBOL);
          trade.PositionClose(symbol);
       }
    }
+}
+
+//+------------------------------------------------------------------+
+//| Get last position's entry price                                  |
+//+------------------------------------------------------------------+
+double GetLastPositionPrice()
+{
+   datetime latestTime = 0;
+   double latestPrice = 0;
+   for(int i = PositionsTotal()-1; i >=0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      datetime posTime = PositionGetInteger(POSITION_TIME);
+      if(posTime > latestTime)
+      {
+         latestTime = posTime;
+         latestPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      }
+   }
+   return latestPrice;
 }
