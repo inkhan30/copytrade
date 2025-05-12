@@ -23,7 +23,7 @@
  input int    ConsecutiveCandles   = 2;                                          // Number of consecutive candles for initial entry
  input double InitialLotSize       = 0.01;                                       // <-- New: lot size for the very first trade
  input int    InitialTPPoints      = 100;                                        // <-- New: take‑profit for the initial trade, in points
- input string CustomLotSequence    = "0.01,0.02,0.04,0.05,0.06,0.08,0.10,0.12,0.14,0.17,0.21,0.25,0.30,0.36,0.43,0.51,0.62,0.74,0.89,1.06,1.28,1.53,1.84,2.21,2.65"; // Lot sizes per trade
+ input string CustomLotSequence    = "0.02,0.04,0.05,0.06,0.08,0.10,0.12,0.14,0.17,0.21,0.25,0.30,0.36,0.43,0.51,0.62,0.74,0.89,1.06,1.28,1.53,1.84,2.21,2.65"; // Lot sizes per trade
  input int    TriggerPoints        = 500;                                         // Points move to trigger next hedge (50 pips = 500 points)
  input int    ProfitTargetPoints   = 100;                                         // Combined profit target in points (10 pips = 100 points)
  input int    MaxTrades            = 25;                                          // Maximum number of hedges

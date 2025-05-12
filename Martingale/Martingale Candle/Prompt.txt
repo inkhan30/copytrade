@@ -1,0 +1,82 @@
+Strategy Overview
+Initial Entry Condition:
+
+The EA opens the first trade when ConsecutiveCandles (e.g., 2) consecutive bullish (up) or bearish (down) candles are detected.
+
+The initial trade uses a user-defined InitialLotSize and a take-profit (InitialTPPoints).
+
+Hedging Mechanism:
+
+if the candle closes below the price of the current trade open a new trade at the next candle close from the user define lot sequence.
+
+Profit Target:
+
+All positions are closed when the combined unrealized profit reaches ProfitTargetPoints (e.g., 100 points).
+
+Risk Management:
+
+The EA stops opening new trades after MaxTrades (e.g., 25) positions are reached.
+
+No stop-loss is implemented; reliance is on the profit target.
+
+
+Key Input Parameters
+Parameter	Description
+ConsecutiveCandles	Number of consecutive candles to trigger the initial trade.
+InitialLotSize	Lot size for the first trade.
+InitialTPPoints	Take-profit distance (in points) for the initial trade.
+CustomLotSequence	Comma-separated lot sizes for subsequent hedges.
+ProfitTargetPoints	Combined profit (points) to close all trades.
+MaxTrades	Maximum number of trades (initial + hedges).
+MagicNumber	Unique identifier for EA-managed trades.
+
+
+Example Scenario:
+Initial BUY at 1.2000 (0.1 lots)
+
+Price drops → new BUY at 1.1950 (0.2 lots)
+
+Price drops again → new BUY at 1.1900 (0.4 lots)
+
+Market reverses → all positions close when total profit hits 100 points.
+
+
+
+Full Strategy Workflow:
+
+Initial Entry:
+
+Triggers after ConsecutiveCandles bullish/bearish candles.
+
+Example: 2 consecutive green candles → initial BUY with InitialLotSize.
+
+The initial trade uses a user-defined InitialLotSize and a take-profit (InitialTPPoints).
+
+Hedging:
+
+Adds trades in the same direction when the market moves against the latest position.
+
+Example: If initial BUY is at 1.2000 and price closes at 1.1950 in the next candle → new BUY with next lot from CustomLotSequence.
+
+Profit Closure:
+
+Closes all trades when combined profit reaches ProfitTargetPoints.
+
+Example: 100 points net profit → exit all positions.
+
+Risk Control:
+
+Stops opening new trades after MaxTrades 25 (e.g., 25 positions)
+
+Key Input Parameters
+Parameter	Description
+ConsecutiveCandles	Number of consecutive candles to trigger the initial trade.
+InitialLotSize	Lot size for the first trade.
+InitialTPPoints	Take-profit distance (in points) for the initial trade.
+CustomLotSequence	Comma-separated lot sizes for subsequent hedges. (0.02,0.04,0.05,0.06,0.08,0.10,0.12,0.14,0.17,0.21,0.25,0.30,0.36,0.43,0.51,0.62,0.74,0.89,1.06,1.28,1.53,1.84,2.21,2.65)
+ProfitTargetPoints	Combined profit (points) to close all trades.
+MaxTrades	Maximum number of trades (initial + hedges).
+MagicNumber	Unique identifier for EA-managed trades.
+
+
+
