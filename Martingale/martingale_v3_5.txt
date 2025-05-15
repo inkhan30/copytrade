@@ -9,7 +9,9 @@ input int      InitialTPPips       = 100;        // Take-profit in pips
 input int      TotalLotCounts      = 30;         // Total number of hedge positions
 input double   MinLotSize          = 0.02;       // Minimum lot size for hedging
 input double   MaxLotSize          = 2.0;        // Maximum lot size for hedging
-input double   TriggerPips         = 1000;       // Base trigger pips (will auto-generate array)
+input double   BaseTriggerPips     = 1000;       // Base trigger pips (for descending pattern)
+input double   FinalTriggerPips    = 10000;      // Final trigger pips (for ascending pattern)
+input bool     AscendingTriggers   = false;      // True=ascending, False=descending trigger distances
 input int      ProfitTargetPips    = 1000;       // Total profit target in pips
 input int      MagicNumber         = 123456;
 input double   MaxEquityDrawdownPercent = 20.0;  // Max allowed equity drawdown percentage
@@ -76,15 +78,40 @@ void GenerateTriggerPipsArray()
 {
    ArrayResize(triggerPips, TotalLotCounts);
    
-   // Decreasing trigger pips with each hedge
-   for(int i = 0; i < TotalLotCounts; i++)
+   if(AscendingTriggers)
    {
-      triggerPips[i] = TriggerPips * pow(0.97, i); // Each level is 97% of previous
-      triggerPips[i] = NormalizeDouble(triggerPips[i], 2); // Round to 2 decimal places
+      // Custom ascending pattern: 12, 45, 87, 112,..., up to FinalTriggerPips
+      // This creates an accelerating pattern
+      double step = (FinalTriggerPips - 12) / (TotalLotCounts - 1);
+      double acceleration = 1.5; // Adjust this for different curve steepness
+      
+      triggerPips[0] = 12;
+      for(int i = 1; i < TotalLotCounts; i++)
+      {
+         triggerPips[i] = triggerPips[i-1] + (step * pow(i, acceleration));
+         triggerPips[i] = NormalizeDouble(triggerPips[i], 2);
+      }
+      // Ensure the last value matches FinalTriggerPips
+      triggerPips[TotalLotCounts-1] = FinalTriggerPips;
+   }
+   else
+   {
+      // Custom descending pattern: 1000, 970, 940, 920,...
+      triggerPips[0] = BaseTriggerPips;
+      triggerPips[1] = BaseTriggerPips * 0.97; // 970
+      triggerPips[2] = triggerPips[1] * 0.97;  // 940.9
+      
+      // From 4th position, reduce by 20 pips each time
+      for(int i = 3; i < TotalLotCounts; i++)
+      {
+         triggerPips[i] = triggerPips[i-1] - 20;
+         if(triggerPips[i] < 10) triggerPips[i] = 10; // Don't go below 10 pips
+         triggerPips[i] = NormalizeDouble(triggerPips[i], 2);
+      }
    }
    
    // Print generated triggers for verification
-   string triggerStr = "Generated Trigger Pips: ";
+   string triggerStr = "Generated Trigger Pips (" + string(AscendingTriggers ? "Ascending" : "Descending") + "): ";
    for(int i = 0; i < ArraySize(triggerPips); i++)
    {
       triggerStr += DoubleToString(triggerPips[i], 2);
@@ -265,13 +292,17 @@ void ManageHedging()
       double lot = lotSequence[openCount];
       double entryPrice = SymbolInfoDouble(_Symbol, direction == 1 ? SYMBOL_ASK : SYMBOL_BID);
       trade.SetExpertMagicNumber(MagicNumber);
-      trade.PositionOpen(_Symbol, direction == 1 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,
-                         lot, entryPrice, 0, 0);
       
-      // Remove TP from initial position if this is the first hedge
-      if(openCount == 0)
+      if(trade.PositionOpen(_Symbol, direction == 1 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,
+                         lot, entryPrice, 0, 0))
       {
-         RemoveInitialPositionTP();
+         
+         
+         // Remove TP from initial position if this is the first hedge
+         if(openCount == 0)
+         {
+            RemoveInitialPositionTP();
+         }
       }
    }
 }
