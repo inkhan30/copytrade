@@ -9,6 +9,8 @@ input int      InitialTPPips       = 100;        // Take-profit in pips
 input int      TotalLotCounts      = 30;         // Total number of hedge positions
 input double   MinLotSize          = 0.02;       // Minimum lot size for hedging
 input double   MaxLotSize          = 2.0;        // Maximum lot size for hedging
+input int      startTriggerPips    = 200;        // Starting trigger pips for first hedge
+input int      endTriggerPips      = 1000;       // Ending trigger pips for last hedge
 input int      ProfitTargetPips    = 1000;       // Total profit target in pips
 input int      MagicNumber         = 123456;
 input double   MaxEquityDrawdownPercent = 20.0;  // Max allowed equity drawdown percentage
@@ -33,6 +35,13 @@ double initialEntryPrice = 0;
 //+------------------------------------------------------------------+
 int OnInit()
 {
+   // Validate trigger pips range
+   if(startTriggerPips <= 0 || endTriggerPips <= 0 || startTriggerPips >= endTriggerPips)
+   {
+      Alert("Error: Invalid trigger pips range (", startTriggerPips, "-", endTriggerPips, ")");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   
    // Generate dynamic lot sizes and trigger pips
    GenerateLotSequence();
    GenerateTriggerPipsArray();
@@ -66,25 +75,27 @@ void GenerateLotSequence()
    }
    Print(lotStr);
 }
+
 //+------------------------------------------------------------------+
-//| Generate trigger pips array equally divided between 50-1000 pips |
+//| Generate trigger pips array between start and end values         |
 //+------------------------------------------------------------------+
 void GenerateTriggerPipsArray()
 {
    ArrayResize(triggerPips, TotalLotCounts);
    
    // Calculate step between trigger levels
-   double step = (1000.0 - 50.0) / (TotalLotCounts - 1);
+   double step = (endTriggerPips - startTriggerPips) / (TotalLotCounts - 1);
    
-   // Fill the array with equally spaced values from 50 to 1000
+   // Fill the array with equally spaced values from start to end
    for(int i = 0; i < TotalLotCounts; i++)
    {
-      triggerPips[i] = 50.0 + (step * i);
+      triggerPips[i] = startTriggerPips + (step * i);
       triggerPips[i] = NormalizeDouble(triggerPips[i], 2);
    }
    
    // Print generated triggers for verification
-   string triggerStr = "Generated Trigger Pips (50-1000 equally divided): ";
+   string triggerStr = StringFormat("Generated Trigger Pips (%d-%d equally divided): ", 
+                                  startTriggerPips, endTriggerPips);
    for(int i = 0; i < ArraySize(triggerPips); i++)
    {
       triggerStr += DoubleToString(triggerPips[i], 2);
