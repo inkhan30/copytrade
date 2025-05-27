@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| Expert Advisor: RallyTrackerPro_v1                               |                                               | 
+//| Expert Advisor: RallyTrackerPro_v4                               |                                               | 
 //+------------------------------------------------------------------+
 input bool     EnableStrategy      = true;
 input bool     EnableEquityStop    = true;       // Enable/disable equity stop protection
@@ -14,6 +14,10 @@ input int      ProfitTargetPips    = 1000;       // Total profit target in pips
 input int      MagicNumber         = 123456;
 input double   MaxEquityDrawdownPercent = 20.0;  // Max allowed equity drawdown percentage
 input long     AllowedAccountNumber = 123456;    // ONLY THIS ACCOUNT CAN USE THE EA
+input bool     EnableCounterHedge   = true;       // Enable counter-hedge positions
+input int      CounterHedgeEvery   = 10;         // Open counter-hedge after every X positions
+input double   CounterHedgeLotSize = 0.1;        // Lot size for counter-hedge positions
+input int      CounterHedgeSLPips  = 500;        // Stop loss in pips for counter-hedge
 
 
 #include <Trade\Trade.mqh>
@@ -148,6 +152,12 @@ void OnTick()
    else if(totalTrades < TotalLotCounts)
    {
       ManageHedging();
+      // New counter-hedge logic
+        if(EnableCounterHedge && totalTrades % CounterHedgeEvery == 0 && 
+           totalTrades >= CounterHedgeEvery && !HasOpenCounterHedge(totalTrades))
+        {
+            OpenCounterHedge();
+        }
    }
 
    double totalProfit = GetTotalUnrealizedProfit();
@@ -314,21 +324,19 @@ double GetTotalUnrealizedProfit()
    return profit;
 }
 
-//+------------------------------------------------------------------+
-//| Close all trades                                                 |
-//+------------------------------------------------------------------+
+// Modify the CloseAllTrades function to also close counter-hedges
 void CloseAllTrades()
 {
-   for (int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket == 0) continue;
-      if (PositionGetInteger(POSITION_MAGIC) == MagicNumber)
-      {
-         string symbol = PositionGetString(POSITION_SYMBOL);
-         trade.PositionClose(symbol);
-      }
-   }
+    for(int i = PositionsTotal()-1; i >=0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(ticket == 0) continue;
+        if(PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+        {
+            string symbol = PositionGetString(POSITION_SYMBOL);
+            trade.PositionClose(symbol);
+        }
+    }
 }
 
 //+------------------------------------------------------------------+
@@ -341,4 +349,44 @@ void UpdateHighestEquity()
    {
       highestEquity = currentEquity;
    }
+}
+
+// Add these new helper functions
+bool HasOpenCounterHedge(int currentTradeCount)
+{
+    for(int i = PositionsTotal()-1; i >=0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(ticket == 0) continue;
+        if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+        
+        // Check if position is a counter-hedge (opposite direction)
+        if((direction == 1 && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL) ||
+           (direction == -1 && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+void OpenCounterHedge()
+{
+    double price = SymbolInfoDouble(_Symbol, direction == 1 ? SYMBOL_BID : SYMBOL_ASK);
+    double sl = 0;
+    
+    if(CounterHedgeSLPips > 0)
+    {
+        sl = price + (direction == 1 ? CounterHedgeSLPips : -CounterHedgeSLPips) * PIP * _Point;
+    }
+    
+    trade.SetExpertMagicNumber(MagicNumber);
+    trade.PositionOpen(_Symbol, 
+                      direction == 1 ? ORDER_TYPE_SELL : ORDER_TYPE_BUY,
+                      CounterHedgeLotSize,
+                      price,
+                      sl,
+                      0); // No TP for counter-hedge
+    
+    Print("Opened counter-hedge position at price: ", price);
 }
