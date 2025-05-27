@@ -1,5 +1,6 @@
 //+------------------------------------------------------------------+
-//| Expert Advisor: RallyTrackerPro_v4                               |                                               | 
+//| Expert Advisor: Dynamic Hedging Martingale                       |
+//|                Reverse Trigger Distances Version                |
 //+------------------------------------------------------------------+
 input bool     EnableStrategy      = true;
 input bool     EnableEquityStop    = true;       // Enable/disable equity stop protection
@@ -13,12 +14,11 @@ input double   TriggerPips         = 1000;       // Base trigger pips (will auto
 input int      ProfitTargetPips    = 1000;       // Total profit target in pips
 input int      MagicNumber         = 123456;
 input double   MaxEquityDrawdownPercent = 20.0;  // Max allowed equity drawdown percentage
-input long     AllowedAccountNumber = 123456;    // ONLY THIS ACCOUNT CAN USE THE EA
-input bool     EnableCounterHedge   = true;       // Enable counter-hedge positions
-input int      CounterHedgeEvery   = 10;         // Open counter-hedge after every X positions
-input double   CounterHedgeLotSize = 0.1;        // Lot size for counter-hedge positions
-input int      CounterHedgeSLPips  = 500;        // Stop loss in pips for counter-hedge
-
+input bool     EnableCounterHedge   = true;        // Enable counter-hedge positions
+input int      CounterHedgeEvery    = 10;          // Open counter-hedge after every X positions
+input double   CounterHedgeLotSize  = 0.1;         // Lot size for counter-hedge positions
+input int      CounterHedgeSLPips   = 500;         // Stop loss in pips for counter-hedge
+input bool     ReopenAfterSLHit     = true;        // Reopen counter-hedge if SL hits
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -33,6 +33,9 @@ double triggerPips[];
 datetime lastHedgeTime = 0;
 double highestEquity = 0;
 double initialEntryPrice = 0;
+bool counterHedgeActive = false;
+int lastCounterHedgeLevel = -1;
+datetime lastCounterHedgeTime = 0;
 #define PIP 10
 
 //+------------------------------------------------------------------+
@@ -40,13 +43,6 @@ double initialEntryPrice = 0;
 //+------------------------------------------------------------------+
 int OnInit()
 {
-	// Verify account number
-   	long currentAccount = AccountInfoInteger(ACCOUNT_LOGIN);
-   	if(currentAccount != AllowedAccountNumber)
-   	{
-      		Alert("ERROR: Unauthorized account! This EA only works on account #", AllowedAccountNumber);
-      		return INIT_FAILED;
-   	}
    // Generate dynamic lot sizes and trigger pips
    GenerateLotSequence();
    GenerateTriggerPipsArray();
@@ -110,19 +106,6 @@ void GenerateTriggerPipsArray()
 //+------------------------------------------------------------------+
 void OnTick()
 {
-	// First check if we're on the authorized account
-   static bool accountVerified = false;
-   if(!accountVerified)
-   {
-      long currentAccount = AccountInfoInteger(ACCOUNT_LOGIN);
-      if(currentAccount != AllowedAccountNumber)
-      {
-         ExpertRemove(); // Remove the EA from chart
-         return;
-      }
-      accountVerified = true;
-   }
-
    if(!EnableStrategy || equityStopTriggered) return;
 
    UpdateHighestEquity();
@@ -137,6 +120,12 @@ void OnTick()
    int totalTrades = CountOpenTrades();
    if(totalTrades == 0)
    {
+      initialTradeOpened = false;
+      initialEntryPrice = 0;
+      counterHedgeActive = false;
+      lastCounterHedgeLevel = -1;
+      lastCounterHedgeTime = 0;
+      
       if(CheckConsecutiveCandles(direction))
       {
          initialTradeOpened = true;
@@ -152,12 +141,29 @@ void OnTick()
    else if(totalTrades < TotalLotCounts)
    {
       ManageHedging();
-      // New counter-hedge logic
-        if(EnableCounterHedge && totalTrades % CounterHedgeEvery == 0 && 
-           totalTrades >= CounterHedgeEvery && !HasOpenCounterHedge(totalTrades))
-        {
-            OpenCounterHedge();
-        }
+      
+      // Manage counter-hedging - NEW IMPROVED LOGIC
+      if(EnableCounterHedge)
+      {
+         int currentLevel = totalTrades;
+         bool atHedgeLevel = (currentLevel % CounterHedgeEvery == 0);
+         bool newLevelReached = (currentLevel > lastCounterHedgeLevel);
+         bool timePassed = (TimeCurrent() - lastCounterHedgeTime > 60); // 1 min cooldown
+         
+         if(atHedgeLevel && newLevelReached && timePassed)
+         {
+            // Check if we already have a counter-hedge at this level
+            if(!HasOpenCounterHedgeAtLevel(currentLevel))
+            {
+               if(OpenCounterHedge(currentLevel))
+               {
+                  lastCounterHedgeLevel = currentLevel;
+                  lastCounterHedgeTime = TimeCurrent();
+                  Print("Opened counter-hedge at level ", currentLevel);
+               }
+            }
+         }
+      }
    }
 
    double totalProfit = GetTotalUnrealizedProfit();
@@ -166,6 +172,77 @@ void OnTick()
       CloseAllTrades();
       initialTradeOpened = false;
       initialEntryPrice = 0;
+      counterHedgeActive = false;
+      lastCounterHedgeLevel = -1;
+      lastCounterHedgeTime = 0;
+   }
+}
+//+------------------------------------------------------------------+
+//| Check if counter-hedge exists at specific level (MQL5 version)   |
+//+------------------------------------------------------------------+
+bool HasOpenCounterHedgeAtLevel(int level)
+{
+   for(int i = PositionsTotal()-1; i >=0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      
+      // Check if position is a counter-hedge (opposite direction)
+      if((direction == 1 && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL) ||
+         (direction == -1 && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY))
+      {
+         // Check position comment for level info
+         string comment = PositionGetString(POSITION_COMMENT);
+         if(StringFind(comment, "CH-"+IntegerToString(level), 0) != -1)
+         {
+            return true;
+         }
+      }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Open counter-hedge position with level tracking (MQL5 version)   |
+//+------------------------------------------------------------------+
+bool OpenCounterHedge(int level)
+{
+   double price = SymbolInfoDouble(_Symbol, direction == 1 ? SYMBOL_BID : SYMBOL_ASK);
+   double sl = 0;
+   
+   if(CounterHedgeSLPips > 0)
+   {
+      sl = price + (direction == 1 ? CounterHedgeSLPips : -CounterHedgeSLPips) * PIP * _Point;
+   }
+   
+   trade.SetExpertMagicNumber(MagicNumber);
+   //trade.SetComment("CH-"+IntegerToString(level)); // MQL5 uses SetComment()
+   
+   MqlTradeRequest request = {};
+   MqlTradeResult result = {};
+   
+   request.action = TRADE_ACTION_DEAL;
+   request.symbol = _Symbol;
+   request.volume = CounterHedgeLotSize;
+   request.price = price;
+   request.sl = sl;
+   request.tp = 0; // No take profit
+   request.deviation = 10;
+   request.type = direction == 1 ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+   request.magic = MagicNumber;
+   request.comment = "CH-"+IntegerToString(level);
+   
+   if(OrderSend(request, result))
+   {
+      counterHedgeActive = true;
+      Print("Opened counter-hedge at level ", level, " price: ", price, " SL: ", sl, " Ticket: ", result.order);
+      return true;
+   }
+   else
+   {
+      Print("Failed to open counter-hedge at level ", level, ": ", GetLastError());
+      return false;
    }
 }
 
@@ -271,7 +348,7 @@ void ManageHedging()
       trade.PositionOpen(_Symbol, direction == 1 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,
                          lot, entryPrice, 0, 0);
       
-      if(openCount == 0)
+      if(openCount == 1)
       {
          RemoveInitialPositionTP();
       }
@@ -324,19 +401,21 @@ double GetTotalUnrealizedProfit()
    return profit;
 }
 
-// Modify the CloseAllTrades function to also close counter-hedges
+//+------------------------------------------------------------------+
+//| Close all trades                                                 |
+//+------------------------------------------------------------------+
 void CloseAllTrades()
 {
-    for(int i = PositionsTotal()-1; i >=0; i--)
-    {
-        ulong ticket = PositionGetTicket(i);
-        if(ticket == 0) continue;
-        if(PositionGetInteger(POSITION_MAGIC) == MagicNumber)
-        {
-            string symbol = PositionGetString(POSITION_SYMBOL);
-            trade.PositionClose(symbol);
-        }
-    }
+   for (int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if (PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+      {
+         string symbol = PositionGetString(POSITION_SYMBOL);
+         trade.PositionClose(symbol);
+      }
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -349,44 +428,4 @@ void UpdateHighestEquity()
    {
       highestEquity = currentEquity;
    }
-}
-
-// Add these new helper functions
-bool HasOpenCounterHedge(int currentTradeCount)
-{
-    for(int i = PositionsTotal()-1; i >=0; i--)
-    {
-        ulong ticket = PositionGetTicket(i);
-        if(ticket == 0) continue;
-        if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
-        
-        // Check if position is a counter-hedge (opposite direction)
-        if((direction == 1 && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL) ||
-           (direction == -1 && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY))
-        {
-            return true;
-        }
-    }
-    return false;
-}
-
-void OpenCounterHedge()
-{
-    double price = SymbolInfoDouble(_Symbol, direction == 1 ? SYMBOL_BID : SYMBOL_ASK);
-    double sl = 0;
-    
-    if(CounterHedgeSLPips > 0)
-    {
-        sl = price + (direction == 1 ? CounterHedgeSLPips : -CounterHedgeSLPips) * PIP * _Point;
-    }
-    
-    trade.SetExpertMagicNumber(MagicNumber);
-    trade.PositionOpen(_Symbol, 
-                      direction == 1 ? ORDER_TYPE_SELL : ORDER_TYPE_BUY,
-                      CounterHedgeLotSize,
-                      price,
-                      sl,
-                      0); // No TP for counter-hedge
-    
-    Print("Opened counter-hedge position at price: ", price);
 }
