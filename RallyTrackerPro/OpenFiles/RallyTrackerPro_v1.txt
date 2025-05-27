@@ -1,5 +1,6 @@
 //+------------------------------------------------------------------+
-//| Expert Advisor: RallyTrackerPro_v1                               |                                               | 
+//| Expert Advisor: Dynamic Hedging Martingale                       |
+//|                Reverse Trigger Distances Version                |
 //+------------------------------------------------------------------+
 input bool     EnableStrategy      = true;
 input bool     EnableEquityStop    = true;       // Enable/disable equity stop protection
@@ -13,7 +14,6 @@ input double   TriggerPips         = 1000;       // Base trigger pips (will auto
 input int      ProfitTargetPips    = 1000;       // Total profit target in pips
 input int      MagicNumber         = 123456;
 input double   MaxEquityDrawdownPercent = 20.0;  // Max allowed equity drawdown percentage
-input long     AllowedAccountNumber = 123456;    // ONLY THIS ACCOUNT CAN USE THE EA
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -35,13 +35,6 @@ double initialEntryPrice = 0;
 //+------------------------------------------------------------------+
 int OnInit()
 {
-	// Verify account number
-   	long currentAccount = AccountInfoInteger(ACCOUNT_LOGIN);
-   	if(currentAccount != AllowedAccountNumber)
-   	{
-      		Alert("ERROR: Unauthorized account! This EA only works on account #", AllowedAccountNumber);
-      		return INIT_FAILED;
-   	}
    // Generate dynamic lot sizes and trigger pips
    GenerateLotSequence();
    GenerateTriggerPipsArray();
@@ -105,19 +98,6 @@ void GenerateTriggerPipsArray()
 //+------------------------------------------------------------------+
 void OnTick()
 {
-	// First check if we're on the authorized account
-   static bool accountVerified = false;
-   if(!accountVerified)
-   {
-      long currentAccount = AccountInfoInteger(ACCOUNT_LOGIN);
-      if(currentAccount != AllowedAccountNumber)
-      {
-         ExpertRemove(); // Remove the EA from chart
-         return;
-      }
-      accountVerified = true;
-   }
-
    if(!EnableStrategy || equityStopTriggered) return;
 
    UpdateHighestEquity();
@@ -260,7 +240,7 @@ void ManageHedging()
       trade.PositionOpen(_Symbol, direction == 1 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,
                          lot, entryPrice, 0, 0);
       
-      if(openCount == 0)
+      if(openCount == 1)
       {
          RemoveInitialPositionTP();
       }
