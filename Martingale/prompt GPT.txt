@@ -1,0 +1,42 @@
+Overview
+This Expert Advisor implements a simple 2‐candle breakout entry followed by a Martingale‑style hedging sequence.
+
+Initial entry is taken when two consecutive candles close in the same direction (bullish or bearish).
+
+Hedge entries are added in the same direction whenever price moves against the original entry by a user‑defined number of points.
+
+All positions are closed once the combined profit (across all open trades) reaches a user‑defined point target.
+
+Lot sizes for each hedge step are specified in a comma‑separated sequence, and all distance parameters (TP, trigger, profit) are in points.
+
+1. Input Parameters
+Parameter	Type	Description
+EnableStrategy	bool	Master on/off switch for the EA
+ConsecutiveCandles	int	Number of consecutive same‑direction candles to trigger the initial entry (here = 2)
+InitialLotSize	double	Lot size for the very first trade
+InitialTPPoints	int	Take‑profit for the initial trade, in points
+CustomLotSequence	string	Comma‑separated list of lot sizes for each subsequent hedge leg
+TriggerPoints	int	How far (in points) price must move against the last entry to open the next hedge
+ProfitTargetPoints	int	Total combined profit (in points) at which all EA‑opened positions are closed
+MaxTrades	int	Maximum number of hedges allowed (must match the count of entries in CustomLotSequence)
+MagicNumber	ulong	Unique identifier so the EA only manages its own trades
+
+2. Global State Variables
+CTrade trade;
+Wrapper around trade functions (OrderSend, PositionClose, etc.)
+
+int tradeCount;
+How many EA‑opened positions are currently active.
+
+double entryPrices[];
+Stores the entry price of each position.
+
+double positionSizes[];
+Stores the lot size used for each position.
+
+int tradeTypes[];
+Whether each position is a buy or sell.
+
+double customLots[];
+Parsed lot sizes taken from CustomLotSequence.
+

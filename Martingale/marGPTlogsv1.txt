@@ -1,0 +1,127 @@
+//+------------------------------------------------------------------+
+//|                                                   MartingaleEA.mq5|
+//|                        Martingale XAUUSD Basket Strategy         |
+//+------------------------------------------------------------------+
+#property copyright ""
+#property link      ""
+#property version   "1.00"
+#property strict
+
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+
+//--- input parameters
+input double    BaseLot        = 0.04;         // starting lot size
+input double    LotStep        = 0.01;         // lot increase per leg
+input double    ProfitTarget   = 2.0;          // basket profit target in deposit currency
+input ENUM_TIMEFRAMES Timeframe = PERIOD_M1;   // timeframe for signals
+input string    SymbolName     = "XAUUSD";    // trading symbol
+
+//--- global objects and variables
+CTrade          trade;
+CPositionInfo   posInfo;
+bool            isSellCycle    = true;
+double          currentLot;
+datetime        lastCandleTime = 0;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   currentLot = BaseLot;
+   isSellCycle = true;
+   Print("MartingaleEA initialized: ", SymbolName,
+         ", BaseLot=", DoubleToString(BaseLot,2),
+         ", LotStep=", DoubleToString(LotStep,2),
+         ", ProfitTarget=", DoubleToString(ProfitTarget,2));
+   return(INIT_SUCCEEDED);
+  }
+
+//+------------------------------------------------------------------+
+//| Calculate basket profit                                          |
+//+------------------------------------------------------------------+
+double GetBasketProfit()
+  {
+   double total=0.0;
+   int count = PositionsTotal();
+   for(int idx=0; idx<count; idx++)
+     {
+      if(posInfo.SelectByIndex(idx))
+        {
+         if(posInfo.Symbol() == SymbolName)
+            total += posInfo.Profit();
+        }
+     }
+   return(total);
+  }
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+  {
+   // ensure EA runs on correct symbol
+   if(_Symbol != SymbolName) return;
+
+   // only once per new candle
+   datetime candleTime = iTime(SymbolName, Timeframe, 0);
+   if(candleTime <= lastCandleTime) return;
+   lastCandleTime = candleTime;
+
+   double basketProfit = GetBasketProfit();
+
+   // new cycle when no open positions
+   if(PositionsTotal() == 0)
+     {
+      currentLot = BaseLot;
+      isSellCycle = !isSellCycle;
+      PrintFormat("--- New %s cycle starting at %s", isSellCycle?"Sell":"Buy", TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS));
+     }
+
+   // open or close legs
+   if(basketProfit < ProfitTarget)
+     {
+      ENUM_ORDER_TYPE type = isSellCycle? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+      double price = (type==ORDER_TYPE_BUY)
+                     ? SymbolInfoDouble(SymbolName, SYMBOL_ASK)
+                     : SymbolInfoDouble(SymbolName, SYMBOL_BID);
+
+      bool ok = (type==ORDER_TYPE_BUY)
+                ? trade.Buy(currentLot, SymbolName, price)
+                : trade.Sell(currentLot, SymbolName, price);
+      if(ok)
+        {
+         PrintFormat("Opened %s %.2f lots at price %.3f (basketProfit=%.2f)",
+                     isSellCycle?"SELL":"BUY", currentLot, price, basketProfit);
+         currentLot += LotStep;
+        }
+      else
+         PrintFormat("OrderSend failed: %d %s", trade.ResultRetcode(), trade.ResultComment());
+     }
+   else
+     {
+      // close all when target reached
+      int count = PositionsTotal();
+      for(int idx=count-1; idx>=0; idx--)
+        {
+         if(posInfo.SelectByIndex(idx) && posInfo.Symbol()==SymbolName)
+           {
+            ulong ticket = posInfo.Ticket();
+            if(trade.PositionClose(ticket))
+               PrintFormat("Closed ticket %d profit target reached (%.2f)", ticket, basketProfit);
+            else
+               PrintFormat("Failed to close ticket %d: %s", ticket, trade.ResultComment());
+           }
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+  {
+   Print("MartingaleEA stopped");
+  }
+//+------------------------------------------------------------------+

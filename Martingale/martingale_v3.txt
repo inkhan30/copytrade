@@ -1,0 +1,224 @@
+//+------------------------------------------------------------------+
+//| Expert Advisor: Hedging Martingale Strategy (Single Hedge at Candle Close) |
+//+------------------------------------------------------------------+
+input bool     EnableStrategy      = true;
+input int      ConsecutiveCandles  = 2;
+input double   InitialLotSize      = 0.01;
+input int      InitialTPPips       = 100;        // Take-profit in pips
+input string   CustomLotSequence   = "0.02,0.04,0.05,0.06,0.08,0.10,0.12,0.14,0.17,0.21,0.25,0.30,0.36,0.43,0.51,0.62,0.74,0.89,1.06,1.28,1.53,1.84,2.21,2.65,2.90,3.25,3.65,3.95,4.3,4.65";
+input int      ProfitTargetPips    = 1000;        // Total profit target in pips
+input int      MaxTrades           = 30;
+input int      MagicNumber         = 123456;
+
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+int direction = 0; // 1 for Buy, -1 for Sell
+bool initialTradeOpened = false;
+double lotSequence[];
+datetime lastHedgeTime = 0;
+#define PIP 10
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   StringToLotArray(CustomLotSequence);
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Parse custom lot sequence string                                 |
+//+------------------------------------------------------------------+
+void StringToLotArray(string str)
+{
+   string temp[];
+   int count = StringSplit(str, ',', temp);
+   ArrayResize(lotSequence, count);
+   for (int i = 0; i < count; i++)
+   {
+      lotSequence[i] = StringToDouble(temp[i]);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   if (!EnableStrategy) return;
+
+   int totalTrades = CountOpenTrades();
+   if (totalTrades == 0)
+   {
+      if (CheckConsecutiveCandles(direction))
+      {
+         initialTradeOpened = true;
+         double initialPrice = SymbolInfoDouble(_Symbol, direction == 1 ? SYMBOL_ASK : SYMBOL_BID);
+         trade.SetExpertMagicNumber(MagicNumber);
+         Print("First Trade");
+         trade.PositionOpen(_Symbol, direction == 1 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,
+                            InitialLotSize, initialPrice,
+                            0,
+                            initialPrice + (direction == 1 ? InitialTPPips : -InitialTPPips) * PIP * _Point);
+      }
+   }
+   else if (totalTrades < MaxTrades)
+   {
+      ManageHedging();
+   }
+
+   double totalProfit = GetTotalUnrealizedProfit();
+   if (totalProfit >= ProfitTargetPips * PIP * _Point)
+   {
+      CloseAllTrades();
+      initialTradeOpened = false;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Count trades by this EA                                          |
+//+------------------------------------------------------------------+
+int CountOpenTrades()
+{
+   int count = 0;
+   for (int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if (PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+         count++;
+   }
+   return count;
+}
+
+//+------------------------------------------------------------------+
+//| Check for consecutive candles                                    |
+//+------------------------------------------------------------------+
+bool CheckConsecutiveCandles(int &dir)
+{
+   bool bullish = true;
+   bool bearish = true;
+   double openArray[1], closeArray[1];
+
+   for (int i = 1; i <= ConsecutiveCandles; i++)
+   {
+      if (CopyOpen(_Symbol, _Period, i, 1, openArray) != 1 ||
+          CopyClose(_Symbol, _Period, i, 1, closeArray) != 1)
+         return false;
+
+      if (closeArray[0] <= openArray[0]) bullish = false;
+      if (closeArray[0] >= openArray[0]) bearish = false;
+   }
+
+   if (bullish) { dir = 1; return true; }
+   if (bearish) { dir = -1; return true; }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Manage hedging trades - one per candle close                     |
+//+------------------------------------------------------------------+
+void ManageHedging()
+{
+   // Check if we're on a new candle
+   static datetime lastBarTime = 0;
+   datetime currentBarTime = iTime(_Symbol, _Period, 0);
+   if(lastBarTime == currentBarTime) return; // Still on same candle
+   lastBarTime = currentBarTime;
+
+   double lastPrice = GetLastPositionPrice();
+   if(lastPrice == 0) return;
+
+   // Get previous candle's close price (index 1 because index 0 is current candle)
+   double closeArray[1];
+   if(CopyClose(_Symbol, _Period, 1, 1, closeArray) != 1) return;
+   double previousClose = closeArray[0];
+   
+   int openCount = CountOpenTrades();
+
+   // Check if we should hedge based on previous candle close
+   bool conditionMet = false;
+   
+   if(direction == 1) // Initial direction: Buy
+   {
+      // For Buy, hedge when previous candle closes below last position price
+      conditionMet = (previousClose < lastPrice);
+   }
+   else if(direction == -1) // Initial direction: Sell
+   {
+      // For Sell, hedge when previous candle closes above last position price
+      conditionMet = (previousClose > lastPrice);
+   }
+
+   if(conditionMet && openCount < ArraySize(lotSequence) + 1)
+   {
+      // Only hedge once per candle close
+      if(lastHedgeTime == currentBarTime) return;
+      
+      double lot = lotSequence[openCount - 1];
+      double currentPrice = SymbolInfoDouble(_Symbol, direction == 1 ? SYMBOL_ASK : SYMBOL_BID);
+      trade.SetExpertMagicNumber(MagicNumber);
+      Print("Hedge Trade: Lot=", lot, " at ", currentPrice);
+      trade.PositionOpen(_Symbol, direction == 1 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,
+                         lot, currentPrice, 0, 0);
+      
+      lastHedgeTime = currentBarTime; // Remember we hedged on this candle
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get total unrealized profit                                      |
+//+------------------------------------------------------------------+
+double GetTotalUnrealizedProfit()
+{
+   double profit = 0;
+   for (int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if (PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+         profit += PositionGetDouble(POSITION_PROFIT);
+   }
+   return profit;
+}
+
+//+------------------------------------------------------------------+
+//| Close all trades                                                 |
+//+------------------------------------------------------------------+
+void CloseAllTrades()
+{
+   for (int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if (PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+      {
+         string symbol = PositionGetString(POSITION_SYMBOL);
+         trade.PositionClose(symbol);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get last position's entry price                                  |
+//+------------------------------------------------------------------+
+double GetLastPositionPrice()
+{
+   datetime latestTime = 0;
+   double latestPrice = 0;
+   for(int i = PositionsTotal()-1; i >=0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      datetime posTime = PositionGetInteger(POSITION_TIME);
+      if(posTime > latestTime)
+      {
+         latestTime = posTime;
+         latestPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      }
+   }
+   return latestPrice;
+}
