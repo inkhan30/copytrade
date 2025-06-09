@@ -6,7 +6,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2023, MetaQuotes Ltd."
 #property link      "https://www.mql5.com"
-#property version   "1.41"
+#property version   "1.42"
 #property strict
 #property indicator_chart_window
 
@@ -19,7 +19,7 @@ input int      TotalLotCounts          = 30;          // Total number of hedge p
 input double   MinLotSize              = 0.02;        // Minimum lot size for hedging
 input double   MaxLotSize              = 2.0;         // Maximum lot size for hedging
 input double   TriggerPips             = 1000;        // Base trigger pips (auto-generates array)
-input int      ProfitTargetPips        = 1000;        // Total profit target in pips
+input double   ProfitTargetUSD         = 10.0;        // Total profit target in account currency
 input int      MagicNumber             = 123456;      // Unique EA identifier
 input double   EmergencyEquityStopPerc = 2.0;         // Emergency equity % level (0=disable)
 
@@ -40,6 +40,7 @@ input string   NewsEvents              = "2025.06.06 08:30|US Nonfarm Payrolls|H
                                           "2025.06.09 14:00|Fed Chair Speech|High";
 
 // Display Settings
+input bool     EnableChartDisplay      = true;        // Enable/Disable chart panel display
 input color    HeaderColor             = C'0,40,80';  // Dark blue
 input color    ActiveColor             = C'0,100,0';  // Dark green
 input color    InactiveColor           = C'100,0,0';  // Dark red
@@ -574,8 +575,14 @@ string GetEAStatus()
 //+------------------------------------------------------------------+
 void DisplayTradingInfo()
 {
-   // Update current status
+   // Always update current status (used for logging)
    currentStatus = GetEAStatus();
+   
+   // Remove panel if display is disabled
+   if(!EnableChartDisplay) {
+      ObjectsDeleteAll(0, "Panel_");
+      return;
+   }
    
    // Create background panel
    if(ObjectFind(0, "Panel_BG") < 0) {
@@ -755,6 +762,10 @@ void DisplayTradingInfo()
       CreatePanelObject("Panel_StopLevel", stopText, col1, y, InactiveColor, FontSize);
       y += lineHeight;
    }
+   
+   // Display profit target
+   CreatePanelObject("Panel_ProfitTarget", "• Profit Target: " + DoubleToString(ProfitTargetUSD, 2), col1, y, ValueColor, FontSize);
+   y += lineHeight;
    y += sectionSpacing;
    
    // ===== STOP OUT & PROFIT SECTION =====
@@ -923,9 +934,9 @@ void RemoveInitialPositionTP()
 bool CheckProfitTarget()
 {
    double totalProfit = GetTotalUnrealizedProfit();
-   if(totalProfit >= ProfitTargetPips * PIP * _Point) {
+   if(totalProfit >= ProfitTargetUSD) {
       currentStatus = "Profit target reached! Closing ALL trades...";
-      Print("Profit target reached! Closing ALL symbol trades");
+      Print("Profit target reached! Target: ", ProfitTargetUSD, " Achieved: ", totalProfit);
       CloseAllSymbolTrades();
       initialTradeOpened = false;
       initialEntryPrice = 0;
