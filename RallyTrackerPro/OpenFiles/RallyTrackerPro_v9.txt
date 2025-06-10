@@ -10,16 +10,15 @@ input bool     EnableEquityStop    = false;       // Enable/disable equity stop 
 input double   MaxEquityDrawdownPercent = 20.0;   // Max allowed equity drawdown percentage (if enabled)
 input int      ConsecutiveCandles  = 2;
 input double   InitialLotSize      = 0.01;
+input double   LotMultiplier       = 1.5;         // Multiplier for each subsequent hedge position
 input int      InitialTPPips       = 100;        // Take-profit in pips
 input int      TotalLotCounts      = 30;         // Total number of hedge positions
 input int      IntervalPips        = 500;        // Fixed interval between hedges in pips
 input int      ProfitTargetPips    = 1000;       // Total profit target in pips
 input int      MagicNumber         = 123456;
+input bool     UseEMAFilter        = true;       // Enable/disable 200 EMA filter
+input int      EMA_Period          = 200;        // EMA period for trend filter
 
-// Hedge lot sizes array
-//double HedgeLotSizes[] = {0.01,0.02,0.04,0.08,0.16,0.32,0.64,1.28,0.09,0.1}; //,0.11,0.12,0.13,0.14,0.15,0.16,0.17,0.18,0.19,0.20,0.21,0.22,0.23,0.24,0.25,0.26,0.27,0.28,0.29,0.30,0.31,0.32,0.33,0.34,0.35,0.36,0.37,0.38,0.39,0.40,0.41,0.42,0.43,0.44,0.45,0.46,0.47,0.48,0.49,0.50 50 hedge lot sizes
-//double HedgeLotSizes[] = {0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.02,0.02,0.02,0.02,0.02,0.02,0.02,0.02,0.02,0.02,0.03,0.03,0.03,0.03,0.03,0.03,0.03,0.03,0.03,0.03,0.04,0.04,0.04,0.04,0.04,0.04,0.04,0.04,0.04,0.04,0.05,0.05,0.05,0.05,0.05,0.05,0.05,0.05,0.05,0.05}; // 50 hedge lot sizes
-double HedgeLotSizes[] = {0.01,0.03,0.05,0.07,0.09,0.11,0.13,0.15,0.17,0.19,0.21,0.23,0.25,0.27,0.29,0.31,0.33,0.35,0.37,0.39}; // 50 hedge lot sizes
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
 CTrade trade;
@@ -32,10 +31,8 @@ bool equityStopTriggered = false;
 datetime lastHedgeTime = 0;
 double highestEquity = 0;
 double initialEntryPrice = 0;
+int emaHandle = INVALID_HANDLE; // Handle for EMA indicator
 #define PIP 10
-int hedgeCounter = 0; // Track number of hedge positions
-bool counterHedgeActive = false; // Flag for counter-hedge mode
-int counterHedgeSequence = 0; // Tracks counter-hedge sequence position
 
 // Objects for displaying information on chart
 string beLabel = "BreakEvenLabel";
@@ -48,17 +45,15 @@ string rallyValue = "TotalRallyValue";
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   // Verify that we have enough lot sizes for the requested total counts
-   if(ArraySize(HedgeLotSizes) < TotalLotCounts)
+   // Create EMA indicator handle if filter is enabled
+   if(UseEMAFilter)
    {
-      Alert("Error: HedgeLotSizes array (",ArraySize(HedgeLotSizes),") is smaller than TotalLotCounts (",TotalLotCounts,")");
-      return(INIT_FAILED);
-   }
-   // Verify that we have enough lot sizes for the requested total counts
-   if(ArraySize(HedgeLotSizes) < TotalLotCounts)
-   {
-      Print("Error: Not enough hedge lot sizes in array for requested TotalLotCounts");
-      return(INIT_FAILED);
+      emaHandle = iMA(_Symbol, _Period, EMA_Period, 0, MODE_EMA, PRICE_CLOSE);
+      if(emaHandle == INVALID_HANDLE)
+      {
+         Print("Failed to create EMA indicator!");
+         return(INIT_FAILED);
+      }
    }
    
    highestEquity = AccountInfoDouble(ACCOUNT_EQUITY);
@@ -66,14 +61,103 @@ int OnInit()
    // Create chart objects for display
    CreateInfoLabels();
    
+   // Print the calculated lot sizes
+   PrintCalculatedLotSizes();
+   
    return(INIT_SUCCEEDED);
 }
+
+//+------------------------------------------------------------------+
+//| Get current EMA value                                            |
+//+------------------------------------------------------------------+
+double GetEMAValue()
+{
+   if(emaHandle == INVALID_HANDLE) return 0;
+   
+   double emaValue[1];
+   if(CopyBuffer(emaHandle, 0, 0, 1, emaValue) != 1)
+   {
+      Print("Failed to copy EMA buffer!");
+      return 0;
+   }
+   
+   return emaValue[0];
+}
+
+
+//+------------------------------------------------------------------+
+//| Print the calculated lot sizes based on multiplier               |
+//+------------------------------------------------------------------+
+void PrintCalculatedLotSizes()
+{
+   string lotSizesStr = "Calculated Lot Sizes: [";
+   double currentLot = InitialLotSize;
+   
+   for(int i = 0; i < TotalLotCounts; i++)
+   {
+      if(i > 0) currentLot *= LotMultiplier;
+      lotSizesStr += DoubleToString(currentLot, 2);
+      if(i < TotalLotCounts - 1) lotSizesStr += ", ";
+   }
+   lotSizesStr += "]";
+   
+   Print(lotSizesStr);
+}
+
+//+------------------------------------------------------------------+
+//| Get lot size for the specified position index                    |
+//+------------------------------------------------------------------+
+double GetLotSize(int positionIndex)
+{
+   if(positionIndex == 0) return InitialLotSize;
+   
+   double lotSize = InitialLotSize;
+   for(int i = 1; i <= positionIndex; i++)
+   {
+      lotSize *= LotMultiplier;
+   }
+   
+   return NormalizeDouble(lotSize, 2);
+}
+
+//+------------------------------------------------------------------+
+//| Check EMA filter condition                                       |
+//+------------------------------------------------------------------+
+bool CheckEMAFilter(int &dir)
+{
+   if(!UseEMAFilter) return true; // If filter disabled, always return true
+   
+   double emaValue = GetEMAValue();
+   if(emaValue == 0) return false; // Failed to get EMA value
+   
+   double currentClose = iClose(_Symbol, _Period, 1);
+   
+   if(currentClose > emaValue)
+   {
+      dir = 1; // Only allow buy trades
+      return true;
+   }
+   else if(currentClose < emaValue)
+   {
+      dir = -1; // Only allow sell trades
+      return true;
+   }
+   
+   return false; // Price exactly at EMA - no trades
+}
+
 
 //+------------------------------------------------------------------+
 //| Expert deinitialization function                                 |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+   // Release EMA indicator handle
+   if(emaHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(emaHandle);
+   }
+   
    // Remove chart objects when EA is removed
    ObjectDelete(0, beLabel);
    ObjectDelete(0, rallyLabel);
@@ -137,9 +221,9 @@ void UpdateChartInfo()
       return;
    }
    
-   // Calculate break-even price for each direction separately
-   double buyLots = 0, sellLots = 0;
-   double buyWeighted = 0, sellWeighted = 0;
+   // Calculate break-even price
+   double totalLots = 0;
+   double weightedPrice = 0;
    
    for(int i = PositionsTotal()-1; i >=0; i--)
    {
@@ -149,46 +233,26 @@ void UpdateChartInfo()
       
       double lot = PositionGetDouble(POSITION_VOLUME);
       double price = PositionGetDouble(POSITION_PRICE_OPEN);
-      long type = PositionGetInteger(POSITION_TYPE);
       
-      if(type == POSITION_TYPE_BUY)
-      {
-         buyLots += lot;
-         buyWeighted += lot * price;
-      }
-      else
-      {
-         sellLots += lot;
-         sellWeighted += lot * price;
-      }
+      totalLots += lot;
+      weightedPrice += lot * price;
    }
    
-   // Calculate net position
-   double netLots = buyLots - sellLots;
-   double breakEvenPrice = 0;
-   
-   if(netLots != 0)
+   if(totalLots > 0)
    {
-      breakEvenPrice = (buyWeighted - sellWeighted) / netLots;
-      double currentPrice = SymbolInfoDouble(_Symbol, netLots > 0 ? SYMBOL_BID : SYMBOL_ASK);
+      double breakEvenPrice = weightedPrice / totalLots;
+      double currentPrice = SymbolInfoDouble(_Symbol, direction == 1 ? SYMBOL_BID : SYMBOL_ASK);
       double rallyPips = 0;
       
-      if(netLots > 0) // Net long position
+      if(direction == 1)
          rallyPips = (currentPrice - breakEvenPrice) / (_Point * PIP);
-      else // Net short position
+      else
          rallyPips = (breakEvenPrice - currentPrice) / (_Point * PIP);
       
       ObjectSetString(0, beValue, OBJPROP_TEXT, DoubleToString(breakEvenPrice, _Digits));
       ObjectSetString(0, rallyValue, OBJPROP_TEXT, DoubleToString(rallyPips, 1) + " pips");
    }
-   else
-   {
-      // Perfectly hedged - no break-even
-      ObjectSetString(0, beValue, OBJPROP_TEXT, "Hedged");
-      ObjectSetString(0, rallyValue, OBJPROP_TEXT, "0 pips");
-   }
 }
-
 
 //+------------------------------------------------------------------+
 //| Expert tick function                                             |
@@ -209,8 +273,22 @@ void OnTick()
    int totalTrades = CountOpenTrades();
    if(totalTrades == 0)
    {
+      // First check EMA filter if enabled
+      int emaDirection = 0;
+      if(UseEMAFilter && !CheckEMAFilter(emaDirection))
+      {
+         return; // EMA filter condition not met
+      }
+      
+      // Then check consecutive candles
       if(CheckConsecutiveCandles(direction))
       {
+         // If EMA filter is enabled, verify direction matches EMA
+         if(UseEMAFilter && direction != emaDirection)
+         {
+            return; // Direction doesn't match EMA filter
+         }
+         
          initialTradeOpened = true;
          initialEntryPrice = SymbolInfoDouble(_Symbol, direction == 1 ? SYMBOL_ASK : SYMBOL_BID);
          trade.SetExpertMagicNumber(MagicNumber);
@@ -237,6 +315,7 @@ void OnTick()
    // Update chart information on every tick
    UpdateChartInfo();
 }
+
 //+------------------------------------------------------------------+
 //| Check equity drawdown                                            |
 //+------------------------------------------------------------------+
@@ -294,7 +373,7 @@ bool CheckConsecutiveCandles(int &dir)
 }
 
 //+------------------------------------------------------------------+
-//| Fixed ManageHedging function with proper array bounds checking   |
+//| Manage hedging with fixed interval                               |
 //+------------------------------------------------------------------+
 void ManageHedging()
 {
@@ -303,16 +382,7 @@ void ManageHedging()
    double currentPrice = SymbolInfoDouble(_Symbol, direction == 1 ? SYMBOL_BID : SYMBOL_ASK);
    int openCount = CountOpenTrades();
    
-   // Prevent exceeding TotalLotCounts
    if(openCount >= TotalLotCounts) return;
-   
-   // Reset counter-hedge if no positions exist
-   if(openCount == 0)
-   {
-      counterHedgeActive = false;
-      counterHedgeSequence = 0;
-      hedgeCounter = 0;
-   }
    
    double triggerPrice = initialEntryPrice;
    if(direction == 1)
@@ -336,63 +406,15 @@ void ManageHedging()
    
    if(conditionMet)
    {
-      // Activate counter-hedging only after 5 positions
-      if(openCount >= 5 && !counterHedgeActive)
-      {
-         counterHedgeActive = true;
-         counterHedgeSequence = 0;
-      }
-      
-      // SAFETY CHECK: Ensure we don't exceed array bounds
-      int arraySize = ArraySize(HedgeLotSizes);
-      if(openCount >= arraySize)
-      {
-         Print("Error: Not enough hedge lot sizes in array for position ", openCount);
-         return;
-      }
-      
+      double lot = GetLotSize(openCount);
       double entryPrice = SymbolInfoDouble(_Symbol, direction == 1 ? SYMBOL_ASK : SYMBOL_BID);
+      trade.SetExpertMagicNumber(MagicNumber);
+      trade.PositionOpen(_Symbol, direction == 1 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,
+                         lot, entryPrice, 0, 0);
       
-      if(counterHedgeActive)
+      if(openCount == 1)
       {
-         // Alternate between main hedge and counter-hedge
-         if(counterHedgeSequence % 2 == 0)
-         {
-            // Open main hedge position
-            if(openCount < arraySize) // Additional safety check
-            {
-               trade.SetExpertMagicNumber(MagicNumber);
-               trade.PositionOpen(_Symbol, direction == 1 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,
-                                 HedgeLotSizes[openCount], entryPrice, 0, 0);
-            }
-         }
-         else
-         {
-            // Open counter-hedge position (opposite direction)
-            int counterIndex = (counterHedgeSequence-1)/2;
-            if(counterIndex < arraySize) // Safety check for counter-hedge
-            {
-               trade.SetExpertMagicNumber(MagicNumber);
-               trade.PositionOpen(_Symbol, direction == 1 ? ORDER_TYPE_SELL : ORDER_TYPE_BUY,
-                                 HedgeLotSizes[counterIndex], entryPrice, 0, 0);
-            }
-         }
-         counterHedgeSequence++;
-      }
-      else
-      {
-         // Normal hedge position
-         if(openCount < arraySize) // Safety check
-         {
-            trade.SetExpertMagicNumber(MagicNumber);
-            trade.PositionOpen(_Symbol, direction == 1 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,
-                              HedgeLotSizes[openCount], entryPrice, 0, 0);
-            
-            if(openCount == 1)
-            {
-               RemoveInitialPositionTP();
-            }
-         }
+         RemoveInitialPositionTP();
       }
    }
 }
