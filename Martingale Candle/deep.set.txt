@@ -1,0 +1,51 @@
+// Core Strategy
+EnableStrategy=true
+EnableEquityStop=true
+MaxEquityDrawdownPercent=25.0
+ConsecutiveCandles=2
+InitialLotSize=0.1
+LotMultiplier=1.8
+InitialTPPips=300
+CustomLotSequence=
+ProfitTargetUSD=30.0
+MaxTrades=10
+MagicNumber=202406
+UseEMAFilter=true
+EMA_Period=50
+EmergencyEquityStopPerc=3.0
+
+// Hedging Activation
+EnableHedging=true
+UseDrawdownCondition=true
+MaxHedgeDrawdownPips=100
+
+// Reverse Hedge Settings
+EnableReverseHedging=true
+ReverseHedgeAfterTrades=2
+ReverseHedgeTriggerPips=150.0
+ReverseLotMultiplier=1.5
+ReverseInitialLotSize=0.05
+MaxReverseTrades=3
+ReverseHedgeMinPips=120
+ReverseHedgeTPPips=200
+
+// Time Filter
+EnableTimeFilter=true
+UseLocalComputerTime=true
+StartHourIST=23
+StartMinuteIST=0
+EndHourIST=8
+EndMinuteIST=0
+
+// News Filter
+EnableNewsFilter=true
+NewsBufferMinutes=45
+NewsLookAheadHours=48
+NewsEvents="2025.06.06 08:30|US Nonfarm Payrolls|High;2025.06.06 12:30|US Trade Balance|Medium;2025.06.09 14:00|Fed Chair Speech|High"
+
+// Display
+EnableChartDisplay=true
+HeaderColor=65280
+ValueColor=65535
+BackgroundColor=1973790
+FontSize=10
