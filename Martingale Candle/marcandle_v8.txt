@@ -1,0 +1,947 @@
+//+------------------------------------------------------------------+
+//| Expert Advisor: Rally Tracker Pro with Enhanced Risk Management  |
+//+------------------------------------------------------------------+
+input bool     EnableStrategy          = true;        // Enable/Disable trading strategy
+input bool     EnableEquityStop        = false;       // Enable equity stop protection
+input double   MaxEquityDrawdownPercent = 20.0;       // Max allowed equity drawdown percentage
+input int      ConsecutiveCandles      = 3;           // Number of consecutive candles required
+input double   InitialLotSize          = 0.01;        // Initial trade lot size
+input double   LotMultiplier           = 1.5;         // Multiplier for each subsequent hedge position
+input int      InitialTPPips           = 100;         // Initial take-profit in pips
+input string   CustomLotSequence       = "";          // Custom lot sizes (leave empty to use multiplier)
+input double   ProfitTargetUSD         = 10.0;        // Total profit target in account currency
+input int      MaxTrades               = 30;          // Maximum trades allowed
+input int      MagicNumber             = 123456;      // Unique EA identifier
+input bool     UseEMAFilter            = true;        // Enable/disable EMA filter
+input int      EMA_Period              = 200;         // EMA period for trend filter
+input double   EmergencyEquityStopPerc = 2.0;         // Emergency equity % level (0=disable)
+
+// Hedging Activation Settings
+input bool     EnableHedging           = true;        // Enable main hedging logic
+input bool     UseDrawdownCondition    = true;        // Enable drawdown condition for hedging
+input int      MaxHedgeDrawdownPips    = 200;         // Minimum drawdown (pips) required to hedge
+
+// Reverse Hedge Settings
+input bool     EnableReverseHedging    = true;        // Enable reverse hedging logic
+input int      ReverseHedgeAfterTrades = 5;           // Start reverse hedging after X same-side trades
+input double   ReverseHedgeTriggerPips = 100;         // Pip distance to trigger reverse hedge
+input double   ReverseLotMultiplier    = 1.5;         // Multiplier for reverse lot sequence
+input double   ReverseInitialLotSize   = 0.01;        // Initial lot size for reverse hedge
+input int      MaxReverseTrades        = 5;           // Maximum reverse trades allowed
+input int      ReverseHedgeMinPips     = 50;          // Minimum pips to trigger reverse hedge
+input int      ReverseHedgeTPPips      = 50;          // Take profit for reverse hedges in pips
+
+// Enhanced Time Filter Settings
+input bool     EnableTimeFilter        = true;        // Enable time filter
+input bool     UseLocalComputerTime    = true;        // Use local computer time (true) or broker time (false)
+input int      StartHourIST            = 23;          // Start hour (23 = 11 PM)
+input int      StartMinuteIST          = 0;           // Start minute (0)
+input int      EndHourIST              = 6;           // End hour (6 = 6 AM)
+input int      EndMinuteIST            = 0;           // End minute (0)
+
+// News Filter Settings
+input bool     EnableNewsFilter        = true;        // Enable news time filter
+input int      NewsBufferMinutes       = 30;          // Minutes before/after news to pause trades
+input int      NewsLookAheadHours      = 48;          // Display news within next X hours
+input string   NewsEvents              = "2025.06.06 08:30|US Nonfarm Payrolls|High;"
+                                         "2025.06.06 12:30|US Trade Balance|Medium;"
+                                         "2025.06.09 14:00|Fed Chair Speech|High";
+
+// Display Settings
+input bool     EnableChartDisplay      = true;        // Enable/Disable chart panel display
+input color    HeaderColor             = C'0,40,80'; // Dark blue
+input color    ValueColor              = clrGold;     // Gold
+input color    BackgroundColor         = C'30,30,30'; // Dark gray
+input int      FontSize                = 10;          // Display font size
+
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+#include <Trade\AccountInfo.mqh>
+CTrade trade;
+CPositionInfo positionInfo;
+CAccountInfo accountInfo;
+
+// Global Variables
+int direction = 0;                  // 1 for Buy, -1 for Sell
+bool initialTradeOpened = false;    // Flag for initial trade
+double lotSequence[];               // Array for dynamic lot sizes
+double reverseLotSequence[];        // Array for reverse lot sizes
+datetime lastHedgeTime = 0;         // Last hedge position time
+datetime lastReverseHedgeTime = 0;  // Last reverse hedge time
+double initialEntryPrice = 0;       // Initial trade entry price
+double lastMainEntryPrice = 0;      // Last main sequence entry price
+double lastReverseEntryPrice = 0;   // Last reverse sequence entry price
+bool emergencyStopTriggered = false;// Emergency stop flag
+double highestBalance = 0;          // Highest account balance achieved
+string currentStatus = "Initializing EA...";  // Current EA status message
+int emaHandle = INVALID_HANDLE;
+bool useCustomLots = false;
+int sameDirectionCount = 0;         // Count of same-direction trades
+int reverseTradeCount = 0;          // Count of reverse trades
+#define PIP 10                      // Pip multiplier (10 for 5-digit brokers)
+#define IST_OFFSET_SECONDS 19800    // 5.5 hours in seconds (GMT+5.5)
+
+// News event structure
+struct NewsEventStruct {
+   datetime time;      // Broker time (UTC)
+   string   title;     // Event title
+   string   impact;    // Impact level
+   color    textColor; // Display color
+   bool     isHMR;     // High Impact News flag
+};
+NewsEventStruct newsEventsArray[];  // Stores parsed news events
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   highestBalance = accountInfo.Balance();  // Initialize with current balance
+   currentStatus = "EA initialized. Waiting for market conditions...";
+   sameDirectionCount = 0;
+   reverseTradeCount = 0;
+   
+   // Initialize EMA indicator if enabled
+   if(UseEMAFilter) {
+      emaHandle = iMA(_Symbol, _Period, EMA_Period, 0, MODE_EMA, PRICE_CLOSE);
+      if(emaHandle == INVALID_HANDLE) {
+         Print("Failed to create EMA indicator!");
+         return(INIT_FAILED);
+      }
+   }
+   
+   // Process lot size configuration
+   if(StringLen(CustomLotSequence) > 0) {
+      useCustomLots = true;
+      StringToLotArray(CustomLotSequence);
+      Print("Using custom lot sequence");
+   }
+   else {
+      useCustomLots = false;
+      GenerateLotSequence();
+      Print("Using multiplier-generated lot sequence");
+   }
+   
+   // Generate reverse lot sequence
+   GenerateReverseLotSequence();
+   
+   // Parse news events
+   ParseNewsEvents();
+   
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Generate reverse lot sequence                                    |
+//+------------------------------------------------------------------+
+void GenerateReverseLotSequence()
+{
+   ArrayResize(reverseLotSequence, MaxReverseTrades);
+   double currentLot = ReverseInitialLotSize;
+   
+   for(int i = 0; i < MaxReverseTrades; i++) {
+      reverseLotSequence[i] = NormalizeDouble(currentLot, 2);
+      currentLot *= ReverseLotMultiplier;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Parse custom lot sequence string                                 |
+//+------------------------------------------------------------------+
+void StringToLotArray(string str)
+{
+   string temp[];
+   int count = StringSplit(str, ',', temp);
+   ArrayResize(lotSequence, count);
+   for(int i = 0; i < count; i++) {
+      lotSequence[i] = StringToDouble(temp[i]);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Generate lot sequence using multiplier                           |
+//+------------------------------------------------------------------+
+void GenerateLotSequence()
+{
+   ArrayResize(lotSequence, MaxTrades-1);
+   double currentLot = InitialLotSize * LotMultiplier;
+   
+   for(int i = 0; i < MaxTrades-1; i++) {
+      lotSequence[i] = NormalizeDouble(currentLot, 2);
+      currentLot *= LotMultiplier;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Parse news events from input string                              |
+//+------------------------------------------------------------------+
+void ParseNewsEvents()
+{
+   if(NewsEvents == "") return;
+   
+   string events[];
+   int count = StringSplit(NewsEvents, ';', events);
+   ArrayResize(newsEventsArray, count);
+   int validCount = 0;
+   
+   for(int i = 0; i < count; i++) {
+      string fields[];
+      int fieldCount = StringSplit(events[i], '|', fields);
+      
+      if(fieldCount >= 3) {
+         NewsEventStruct event;
+         event.time = StringToTime(fields[0]);
+         if(event.time <= 0) continue;  // Skip invalid times
+         
+         event.title = fields[1];
+         event.impact = fields[2];
+         event.isHMR = (event.impact == "High"); // Mark high impact as HMR
+         
+         // Set color based on impact level
+         if(event.impact == "Low") event.textColor = clrLawnGreen;
+         else if(event.impact == "Medium") event.textColor = clrGold;
+         else event.textColor = clrTomato;  // High impact
+         
+         newsEventsArray[validCount] = event;
+         validCount++;
+      }
+   }
+   ArrayResize(newsEventsArray, validCount);
+}
+
+//+------------------------------------------------------------------+
+//| Check if current time is near news event                         |
+//+------------------------------------------------------------------+
+bool IsNewsTime()
+{
+   if(!EnableNewsFilter || ArraySize(newsEventsArray) == 0) return false;
+   
+   datetime currentTime = TimeCurrent();
+   for(int i = 0; i < ArraySize(newsEventsArray); i++) {
+      datetime newsStart = newsEventsArray[i].time - NewsBufferMinutes * 60;
+      datetime newsEnd = newsEventsArray[i].time + NewsBufferMinutes * 60;
+      
+      if(currentTime >= newsStart && currentTime <= newsEnd) {
+         return true;
+      }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check if current time is near HMR news event                     |
+//+------------------------------------------------------------------+
+bool IsHMRNewsTime()
+{
+   if(!EnableNewsFilter || ArraySize(newsEventsArray) == 0) return false;
+   
+   datetime currentTime = TimeCurrent();
+   for(int i = 0; i < ArraySize(newsEventsArray); i++) {
+      if(!newsEventsArray[i].isHMR) continue; // Only consider HMR events
+      
+      datetime buffer = NewsBufferMinutes * 60;
+      datetime newsStart = newsEventsArray[i].time - buffer;
+      datetime newsEnd = newsEventsArray[i].time + buffer;
+      
+      if(currentTime >= newsStart && currentTime <= newsEnd) {
+         return true;
+      }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   ObjectsDeleteAll(0, "Panel_");
+   Comment("");
+   if(emaHandle != INVALID_HANDLE) IndicatorRelease(emaHandle);
+}
+
+//+------------------------------------------------------------------+
+//| Get broker time in UTC                                           |
+//+------------------------------------------------------------------+
+datetime GetBrokerTime()
+{
+   if(UseLocalComputerTime) 
+      return TimeLocal();
+   return TimeCurrent();
+}
+
+//+------------------------------------------------------------------+
+//| Convert UTC to IST                                               |
+//+------------------------------------------------------------------+
+datetime UTCtoIST(datetime utcTime)
+{
+   return utcTime + IST_OFFSET_SECONDS;
+}
+
+//+------------------------------------------------------------------+
+//| Check if current time is within trading hours (IST)              |
+//+------------------------------------------------------------------+
+bool IsTradingTime()
+{
+   if(!EnableTimeFilter) return true;
+   
+   datetime brokerTime = GetBrokerTime();
+   datetime istTime = UTCtoIST(brokerTime);
+   MqlDateTime istStruct;
+   TimeToStruct(istTime, istStruct);
+   
+   int currentMinutes = istStruct.hour * 60 + istStruct.min;
+   int startMinutes = StartHourIST * 60 + StartMinuteIST;
+   int endMinutes = EndHourIST * 60 + EndMinuteIST;
+
+   // Handle overnight sessions
+   if(startMinutes >= endMinutes) {
+      return (currentMinutes >= startMinutes || currentMinutes < endMinutes);
+   } else {
+      return (currentMinutes >= startMinutes && currentMinutes < endMinutes);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get current EMA value                                            |
+//+------------------------------------------------------------------+
+double GetEMAValue()
+{
+   if(emaHandle == INVALID_HANDLE) return 0;
+   
+   double emaValue[1];
+   if(CopyBuffer(emaHandle, 0, 0, 1, emaValue) != 1) {
+      Print("Failed to copy EMA buffer!");
+      return 0;
+   }
+   return emaValue[0];
+}
+
+//+------------------------------------------------------------------+
+//| Check EMA filter condition                                       |
+//+------------------------------------------------------------------+
+bool CheckEMAFilter(int &dir)
+{
+   if(!UseEMAFilter) return true;
+   
+   double emaValue = GetEMAValue();
+   if(emaValue == 0) return false;
+   
+   double currentClose = iClose(_Symbol, _Period, 1);
+   
+   if(currentClose > emaValue) {
+      dir = 1; // Only allow buy trades
+      return true;
+   }
+   else if(currentClose < emaValue) {
+      dir = -1; // Only allow sell trades
+      return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate dynamic equity stop level                              |
+//+------------------------------------------------------------------+
+double CalculateEquityStopLevel()
+{
+   // Update highest balance if current balance is higher
+   double currentBalance = accountInfo.Balance();
+   if(currentBalance > highestBalance) {
+      highestBalance = currentBalance;
+   }
+   
+   // Only use percentage-based stop if enabled
+   if(EmergencyEquityStopPerc > 0) {
+      return NormalizeDouble(highestBalance * (EmergencyEquityStopPerc / 100.0), 2);
+   }
+   return 0; // Disabled
+}
+
+//+------------------------------------------------------------------+
+//| Check emergency equity stop condition                            |
+//+------------------------------------------------------------------+
+bool CheckEmergencyStop()
+{
+   double equityStopLevel = CalculateEquityStopLevel();
+   if(equityStopLevel <= 0) return false;
+   
+   double equity = accountInfo.Equity();
+   if(equity <= equityStopLevel && !emergencyStopTriggered) {
+      emergencyStopTriggered = true;
+      currentStatus = "EMERGENCY STOP ACTIVATED! Closing ALL EA trades...";
+      CloseAllEATrades();
+      return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Create or update panel object                                    |
+//+------------------------------------------------------------------+
+void CreatePanelObject(string name, string text, int x, int y, 
+                      color clr, int fontSize, string font="Arial")
+{
+   if(ObjectFind(0, name) < 0) {
+      ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+      ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+      ObjectSetInteger(0, name, OBJPROP_BACK, true);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   }
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, fontSize);
+   ObjectSetString(0, name, OBJPROP_FONT, font);
+}
+
+//+------------------------------------------------------------------+
+//| Display trading information panel                                |
+//+------------------------------------------------------------------+
+void DisplayTradingInfo()
+{
+   if(!EnableChartDisplay) {
+      ObjectsDeleteAll(0, "Panel_");
+      return;
+   }
+   
+   // Create background panel
+   if(ObjectFind(0, "Panel_BG") < 0) {
+      ObjectCreate(0, "Panel_BG", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, "Panel_BG", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, "Panel_BG", OBJPROP_XDISTANCE, 10);
+      ObjectSetInteger(0, "Panel_BG", OBJPROP_YDISTANCE, 20);
+      ObjectSetInteger(0, "Panel_BG", OBJPROP_XSIZE, 350);
+      ObjectSetInteger(0, "Panel_BG", OBJPROP_YSIZE, 380); // Increased for news display
+      ObjectSetInteger(0, "Panel_BG", OBJPROP_BGCOLOR, BackgroundColor);
+      ObjectSetInteger(0, "Panel_BG", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+      ObjectSetInteger(0, "Panel_BG", OBJPROP_BORDER_COLOR, clrDimGray);
+      ObjectSetInteger(0, "Panel_BG", OBJPROP_BACK, true);
+      ObjectSetInteger(0, "Panel_BG", OBJPROP_SELECTABLE, false);
+   }
+   
+   datetime brokerTime = GetBrokerTime();
+   datetime istTime = UTCtoIST(brokerTime);
+   string timeStr = TimeToString(istTime, TIME_MINUTES|TIME_SECONDS);
+   int y = 25;
+   int lineHeight = 20;
+   int col1 = 15;
+   color sectionColor = clrSilver;
+
+   // Header
+   CreatePanelObject("Panel_Header", "RALLY TRACKER PRO", col1, y, HeaderColor, FontSize+2, "Arial Bold");
+   y += lineHeight;
+   CreatePanelObject("Panel_Time", "• IST: " + timeStr, col1, y, ValueColor, FontSize);
+   y += lineHeight;
+   
+   // EA Status
+   CreatePanelObject("Panel_Status", "• Status: " + currentStatus, col1, y, ValueColor, FontSize);
+   y += lineHeight + 5;
+   
+   // Trade Counts
+   CreatePanelObject("Panel_MainCount", "• Main Trades: " + IntegerToString(sameDirectionCount), col1, y, ValueColor, FontSize);
+   y += lineHeight;
+   CreatePanelObject("Panel_ReverseCount", "• Reverse Trades: " + IntegerToString(reverseTradeCount), col1, y, ValueColor, FontSize);
+   y += lineHeight;
+   
+   // News Filter
+   if(EnableNewsFilter) {
+      string newsStatus = IsNewsTime() ? "ACTIVE" : "INACTIVE";
+      color newsColor = IsNewsTime() ? clrRed : clrLime;
+      CreatePanelObject("Panel_News", "• News Filter: " + newsStatus, col1, y, newsColor, FontSize);
+      y += lineHeight;
+      
+      // Show next HMR news event
+      if(ArraySize(newsEventsArray) > 0) {
+         datetime nextHMR = 0;
+         string nextTitle = "";
+         for(int i = 0; i < ArraySize(newsEventsArray); i++) {
+            if(newsEventsArray[i].isHMR && newsEventsArray[i].time > TimeCurrent()) {
+               if(nextHMR == 0 || newsEventsArray[i].time < nextHMR) {
+                  nextHMR = newsEventsArray[i].time;
+                  nextTitle = newsEventsArray[i].title;
+               }
+            }
+         }
+         if(nextHMR > 0) {
+            string nextTimeStr = TimeToString(nextHMR - NewsBufferMinutes*60, TIME_DATE|TIME_MINUTES);
+            CreatePanelObject("Panel_NextHMR", "• Next HMR: " + nextTimeStr + " " + nextTitle, col1, y, clrOrange, FontSize);
+            y += lineHeight;
+         }
+      }
+   }
+   
+   // Time Filter
+   if(EnableTimeFilter) {
+      string sessionStatus = IsTradingTime() ? "ACTIVE" : "INACTIVE";
+      color sessionColor = IsTradingTime() ? clrLime : clrRed;
+      CreatePanelObject("Panel_Session", "• Trading Session: " + sessionStatus, col1, y, sessionColor, FontSize);
+      y += lineHeight;
+   }
+   
+   // Account Information
+   CreatePanelObject("Panel_AccHeader", "─── ACCOUNT ───", col1, y, sectionColor, FontSize+1);
+   y += lineHeight;
+   
+   double balance = accountInfo.Balance();
+   double equity = accountInfo.Equity();
+   double unrealizedProfit = GetTotalEAUnrealizedProfit();
+   double equityStopLevel = CalculateEquityStopLevel();
+   
+   CreatePanelObject("Panel_Balance", "• Balance: " + DoubleToString(balance, 2), col1, y, ValueColor, FontSize);
+   y += lineHeight;
+   CreatePanelObject("Panel_Equity", "• Equity: " + DoubleToString(equity, 2), col1, y, ValueColor, FontSize);
+   y += lineHeight;
+   
+   color plColor = unrealizedProfit >= 0 ? clrLime : clrRed;
+   CreatePanelObject("Panel_Unrealized", "• EA Unrealized P/L: " + DoubleToString(unrealizedProfit, 2), col1, y, plColor, FontSize);
+   y += lineHeight;
+   
+   if(equityStopLevel > 0) {
+      CreatePanelObject("Panel_StopLevel", "• Equity Stop: " + DoubleToString(equityStopLevel, 2), col1, y, clrOrange, FontSize);
+      y += lineHeight;
+   }
+   
+   // Profit Target
+   CreatePanelObject("Panel_ProfitTarget", "• Target Profit: " + DoubleToString(ProfitTargetUSD, 2), col1, y, ValueColor, FontSize);
+   y += lineHeight;
+   
+   // Trade Information
+   if(initialEntryPrice > 0) {
+      CreatePanelObject("Panel_TradeHeader", "─── TRADES ───", col1, y, sectionColor, FontSize+1);
+      y += lineHeight;
+      
+      CreatePanelObject("Panel_Entry", "• Entry Price: " + DoubleToString(initialEntryPrice, _Digits), col1, y, ValueColor, FontSize);
+      y += lineHeight;
+      
+      double breakEven = CalculateBreakEvenPrice();
+      if(breakEven > 0) {
+         CreatePanelObject("Panel_BreakEven", "• Break-Even: " + DoubleToString(breakEven, _Digits), col1, y, ValueColor, FontSize);
+         y += lineHeight;
+      }
+      
+      int trades = CountOpenEATrades();
+      CreatePanelObject("Panel_Trades", "• Open EA Trades: " + IntegerToString(trades), col1, y, ValueColor, FontSize);
+      y += lineHeight;
+      
+      // Display current drawdown
+      double lastPrice = GetLastEAPositionPrice();
+      double currentPrice = SymbolInfoDouble(_Symbol, (direction == 1) ? SYMBOL_BID : SYMBOL_ASK);
+      double drawdownPips = MathAbs(lastPrice - currentPrice) / (_Point * PIP);
+      CreatePanelObject("Panel_Drawdown", "• Drawdown: " + DoubleToString(drawdownPips, 1) + " pips", col1, y, clrLightBlue, FontSize);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate break-even price for EA trades                         |
+//+------------------------------------------------------------------+
+double CalculateBreakEvenPrice()
+{
+   double totalVolume = 0;
+   double totalValue = 0;
+   
+   for(int i = PositionsTotal()-1; i >=0; i--) {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      
+      double volume = PositionGetDouble(POSITION_VOLUME);
+      double price = PositionGetDouble(POSITION_PRICE_OPEN);
+      
+      totalVolume += volume;
+      totalValue += price * volume;
+   }
+   
+   if(totalVolume > 0) {
+      return NormalizeDouble(totalValue / totalVolume, _Digits);
+   }
+   return 0;
+}
+
+//+------------------------------------------------------------------+
+//| Strict consecutive candles check                                 |
+//+------------------------------------------------------------------+
+bool CheckStrictConsecutiveCandles(int &dir)
+{
+   double openArray[], closeArray[];
+   int copied = CopyOpen(_Symbol, _Period, 1, ConsecutiveCandles, openArray);
+   if(copied != ConsecutiveCandles) return false;
+   
+   copied = CopyClose(_Symbol, _Period, 1, ConsecutiveCandles, closeArray);
+   if(copied != ConsecutiveCandles) return false;
+
+   bool allBullish = true;
+   bool allBearish = true;
+   
+   for(int i = 0; i < ConsecutiveCandles; i++) {
+      if(closeArray[i] <= openArray[i]) allBullish = false;
+      if(closeArray[i] >= openArray[i]) allBearish = false;
+   }
+
+   if(allBullish) { dir = 1; return true; }
+   if(allBearish) { dir = -1; return true; }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Modified Hedge Logic with Pip Threshold                          |
+//+------------------------------------------------------------------+
+void ManageHedging()
+{
+   // Check if we're on a new candle
+   static datetime lastBarTime = 0;
+   datetime currentBarTime = iTime(_Symbol, _Period, 0);
+   if(lastBarTime == currentBarTime) return;
+   lastBarTime = currentBarTime;
+
+   double lastPrice = GetLastEAPositionPrice();
+   if(lastPrice == 0) return;
+
+   // Get previous candle's close price
+   double prevClose = iClose(_Symbol, _Period, 1);
+   
+   // Calculate current drawdown in pips
+   double currentPrice = SymbolInfoDouble(_Symbol, (direction == 1) ? SYMBOL_BID : SYMBOL_ASK);
+   double drawdownPips = MathAbs(lastPrice - currentPrice) / (_Point * PIP);
+   
+   // Check hedge condition based on settings
+   bool conditionMet = false;
+   if(direction == 1) {
+      if(UseDrawdownCondition) {
+         conditionMet = (prevClose < lastPrice) && (drawdownPips >= MaxHedgeDrawdownPips);
+      }
+      else {
+         conditionMet = (prevClose < lastPrice);
+      }
+   }
+   else if(direction == -1) {
+      if(UseDrawdownCondition) {
+         conditionMet = (prevClose > lastPrice) && (drawdownPips >= MaxHedgeDrawdownPips);
+      }
+      else {
+         conditionMet = (prevClose > lastPrice);
+      }
+   }
+
+   if(conditionMet)
+   {
+      int openCount = CountOpenEATrades();
+      if(openCount >= MaxTrades) return;
+      
+      if(lastHedgeTime == currentBarTime) return;
+      
+      double lot = 0;
+      if(useCustomLots && sameDirectionCount-1 < ArraySize(lotSequence)) {
+         lot = lotSequence[sameDirectionCount-1];
+      }
+      else if(!useCustomLots && sameDirectionCount-1 < ArraySize(lotSequence)) {
+         lot = lotSequence[sameDirectionCount-1];
+      }
+      else {
+         lot = lotSequence[ArraySize(lotSequence)-1];
+      }
+      
+      trade.SetExpertMagicNumber(MagicNumber);
+      trade.PositionOpen(_Symbol, direction == 1 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,
+                         lot, currentPrice, 0, 0);
+      
+      // Update counters and prices
+      sameDirectionCount++;
+      lastMainEntryPrice = currentPrice;
+      lastHedgeTime = currentBarTime;
+      
+      // Remove TP from initial trade after first hedge
+      if(sameDirectionCount == 2) RemoveInitialPositionTP();
+      
+      // Update status message with condition info
+      string conditionMsg = UseDrawdownCondition ? 
+                           "(" + DoubleToString(drawdownPips, 1) + " pips drawdown)" :
+                           "(drawdown condition disabled)";
+      currentStatus = "Hedge added at " + DoubleToString(currentPrice, _Digits) + " " + conditionMsg;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Reverse Hedge Logic                                              |
+//+------------------------------------------------------------------+
+void ManageReverseHedging()
+{
+   // Check if we're on a new candle
+   static datetime lastBarTime = 0;
+   datetime currentBarTime = iTime(_Symbol, _Period, 0);
+   if(lastBarTime == currentBarTime) return;
+   lastBarTime = currentBarTime;
+   
+   // Check if we should consider reverse hedging
+   if(sameDirectionCount < ReverseHedgeAfterTrades || reverseTradeCount >= MaxReverseTrades) 
+      return;
+      
+   // Get last same-direction entry price
+   double lastMainPrice = GetLastMainPositionPrice();
+   if(lastMainPrice == 0) return;
+   
+   // Get previous candle's close price
+   double prevClose = iClose(_Symbol, _Period, 1);
+   
+   // Calculate current retracement in pips
+   double currentPrice = SymbolInfoDouble(_Symbol, (direction == 1) ? SYMBOL_ASK : SYMBOL_BID);
+   double retracePips = MathAbs(lastMainPrice - currentPrice) / (_Point * PIP);
+   
+   // Check reverse hedge condition
+   bool conditionMet = false;
+   double triggerPrice = 0;
+   
+   if(direction == 1) { // Main direction is long, so reverse is short
+      triggerPrice = lastMainPrice + ReverseHedgeTriggerPips * _Point * PIP;
+      conditionMet = (prevClose >= triggerPrice) && (retracePips >= ReverseHedgeMinPips);
+   }
+   else { // Main direction is short, so reverse is long
+      triggerPrice = lastMainPrice - ReverseHedgeTriggerPips * _Point * PIP;
+      conditionMet = (prevClose <= triggerPrice) && (retracePips >= ReverseHedgeMinPips);
+   }
+
+   if(conditionMet)
+   {
+      if(lastReverseHedgeTime == currentBarTime) return;
+      
+      // Get reverse lot size
+      double lot = reverseLotSequence[reverseTradeCount];
+      if(lot <= 0) lot = ReverseInitialLotSize;
+      
+      // Determine trade direction (opposite of main direction)
+      ENUM_ORDER_TYPE tradeType = direction == 1 ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+      
+      // Calculate take profit
+      double openPrice = SymbolInfoDouble(_Symbol, tradeType == ORDER_TYPE_BUY ? SYMBOL_ASK : SYMBOL_BID);
+      double tpPrice = 0;
+      if(tradeType == ORDER_TYPE_BUY) {
+         tpPrice = openPrice + ReverseHedgeTPPips * _Point * PIP;
+      } else {
+         tpPrice = openPrice - ReverseHedgeTPPips * _Point * PIP;
+      }
+      
+      trade.SetExpertMagicNumber(MagicNumber);
+      trade.PositionOpen(_Symbol, tradeType, lot, openPrice, 0, tpPrice);
+      
+      // Update counters and prices
+      reverseTradeCount++;
+      lastReverseEntryPrice = openPrice;
+      lastReverseHedgeTime = currentBarTime;
+      
+      currentStatus = "Reverse hedge added at " + DoubleToString(openPrice, _Digits) + 
+                      " (" + DoubleToString(retracePips, 1) + " pips retracement)";
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get last main position's entry price                             |
+//+------------------------------------------------------------------+
+double GetLastMainPositionPrice()
+{
+   datetime latestTime = 0;
+   double latestPrice = 0;
+   for(int i = PositionsTotal()-1; i >=0; i--) {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      
+      // Only consider main direction trades
+      if((direction == 1 && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ||
+         (direction == -1 && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)) {
+         datetime posTime = PositionGetInteger(POSITION_TIME);
+         if(posTime > latestTime) {
+            latestTime = posTime;
+            latestPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+         }
+      }
+   }
+   return latestPrice;
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // Block all trading during HMR news periods
+   if(EnableNewsFilter && IsHMRNewsTime()) {
+      currentStatus = "HMR NEWS ACTIVE - All EA trading stopped";
+      DisplayTradingInfo();
+      return;
+   }
+   
+   // Update chart information
+   DisplayTradingInfo();
+   
+   if(!EnableStrategy || emergencyStopTriggered) return;
+   if(CheckEmergencyStop()) return;
+   
+   // Update equity tracking
+   double currentBalance = accountInfo.Balance();
+   if(currentBalance > highestBalance) {
+      highestBalance = currentBalance;
+   }
+   
+   // Check profit target
+   double totalProfit = GetTotalEAUnrealizedProfit();
+   if(totalProfit >= ProfitTargetUSD) {
+      CloseAllEATrades();
+      initialTradeOpened = false;
+      initialEntryPrice = 0;
+      sameDirectionCount = 0;
+      reverseTradeCount = 0;
+      currentStatus = "Profit target reached!";
+      return;
+   }
+
+   // Skip trading logic outside trading hours if no EA trades
+   if(EnableTimeFilter && !IsTradingTime() && CountOpenEATrades() == 0) {
+      currentStatus = "Outside trading session";
+      return;
+   }
+
+   // Check news filter
+   bool inNewsTime = EnableNewsFilter && IsNewsTime();
+   int totalEATrades = CountOpenEATrades();
+   
+   if(totalEATrades == 0) {
+      // Reset counters when no EA trades
+      sameDirectionCount = 0;
+      reverseTradeCount = 0;
+      
+      // Check EMA filter if enabled
+      int emaDirection = 0;
+      if(UseEMAFilter && !CheckEMAFilter(emaDirection)) {
+         currentStatus = "EMA filter blocking trade";
+         return;
+      }
+      
+      // Block initial trades during news time
+      if(inNewsTime) {
+         currentStatus = "News active - blocking initial trade";
+         return;
+      }
+      
+      // Check consecutive candles
+      if(CheckStrictConsecutiveCandles(direction)) {
+         // Verify direction matches EMA filter
+         if(UseEMAFilter && direction != emaDirection) {
+            currentStatus = "Direction doesn't match EMA";
+            return;
+         }
+         
+         initialTradeOpened = true;
+         initialEntryPrice = SymbolInfoDouble(_Symbol, direction == 1 ? SYMBOL_ASK : SYMBOL_BID);
+         trade.SetExpertMagicNumber(MagicNumber);
+         currentStatus = "Opening initial trade";
+         trade.PositionOpen(_Symbol, direction == 1 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,
+                           InitialLotSize, initialEntryPrice,
+                           0,
+                           initialEntryPrice + (direction == 1 ? InitialTPPips : -InitialTPPips) * PIP * _Point);
+         sameDirectionCount = 1;
+         lastMainEntryPrice = initialEntryPrice;
+      }
+   }
+   else {
+      // Manage main sequence hedging
+      if(EnableHedging && sameDirectionCount < MaxTrades) {
+         ManageHedging();
+      }
+      
+      // Manage reverse sequence hedging
+      if(EnableReverseHedging) {
+         ManageReverseHedging();
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Count EA trades only                                             |
+//+------------------------------------------------------------------+
+int CountOpenEATrades()
+{
+   int count = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--) {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+         count++;
+   }
+   return count;
+}
+
+//+------------------------------------------------------------------+
+//| Get last EA position's entry price                               |
+//+------------------------------------------------------------------+
+double GetLastEAPositionPrice()
+{
+   datetime latestTime = 0;
+   double latestPrice = 0;
+   for(int i = PositionsTotal()-1; i >=0; i--) {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      datetime posTime = PositionGetInteger(POSITION_TIME);
+      if(posTime > latestTime) {
+         latestTime = posTime;
+         latestPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      }
+   }
+   return latestPrice;
+}
+
+//+------------------------------------------------------------------+
+//| Get total unrealized profit for EA trades only                   |
+//+------------------------------------------------------------------+
+double GetTotalEAUnrealizedProfit()
+{
+   double profit = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--) {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+         profit += PositionGetDouble(POSITION_PROFIT);
+   }
+   return profit;
+}
+
+//+------------------------------------------------------------------+
+//| Close all EA trades only                                         |
+//+------------------------------------------------------------------+
+void CloseAllEATrades()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--) {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetInteger(POSITION_MAGIC) == MagicNumber) {
+         trade.PositionClose(ticket);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Remove TP from initial EA position                               |
+//+------------------------------------------------------------------+
+void RemoveInitialPositionTP()
+{
+   ulong initialTicket = 0;
+   datetime earliestTime = D'3000.01.01';
+   
+   for(int i = PositionsTotal()-1; i >=0; i--) {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      datetime posTime = PositionGetInteger(POSITION_TIME);
+      if(posTime < earliestTime) {
+         earliestTime = posTime;
+         initialTicket = ticket;
+      }
+   }
+   
+   if(initialTicket == 0) return;
+   
+   if(positionInfo.SelectByTicket(initialTicket)) {
+      trade.PositionModify(initialTicket, positionInfo.StopLoss(), 0);
+   }
+}
