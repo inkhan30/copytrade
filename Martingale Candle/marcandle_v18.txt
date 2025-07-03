@@ -3,8 +3,24 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2023, Rally Tracker Pro"
 #property link      "www.rallytracker.com"
-#property version   "5.0"
+#property version   "5.2"
 #property strict
+
+//===========================================
+//             Trading Type
+//===========================================
+input string   TradingType            = "------ Trading Type ------";
+input bool     HedgeOnClose           = true;        // Hedge on candle close condition
+
+//===========================================
+//          Manual Hedge Trade
+//===========================================
+input string   ManualHedgeSettings    = "------ Manual Hedge Trade ------";
+input string   ManualHedgePips        = "";          // Manual hedge triggers (pips) comma separated (e.g., "700,1400,2100")
+input double   ManualInitialLotSize   = 0.01;        // Initial lot size for manual hedge sequence
+input double   ManualLotMultiplier    = 1.5;         // Lot multiplier for manual hedge sequence
+input int      ManualHedgeTPPips      = 0;           // Take profit in pips for manual hedge trades (0=disable)
+input bool     ManualUseEMAFilter     = true;        // Enable EMA filter for manual hedge trades
 
 //===========================================
 //             Common Settings
@@ -186,6 +202,8 @@ double winRate = 0;                 // Win rate percentage
 double riskRewardRatio = 0;         // Risk-reward ratio
 string currentSymbol;               // Symbol being traded
 bool manualTradeDetected = false;   // Flag for detected manual trades
+double manualHedgePipsArray[];      // Array for manual hedge pip values
+double manualLotSequence[];         // Array for manual hedge lot sizes
 
 //+------------------------------------------------------------------+
 //| Safe Point Value Retrieval                                       |
@@ -285,6 +303,47 @@ void Log(string message)
    if(StringFind(message, "Status:") == 0) {
       currentStatus = StringSubstr(message, 8);
    }
+}
+
+//+------------------------------------------------------------------+
+//| Parse manual hedge pip values                                    |
+//+------------------------------------------------------------------+
+void ParseManualHedgePips()
+{
+   if(StringLen(ManualHedgePips) == 0) {
+      ArrayResize(manualHedgePipsArray, 0);
+      return;
+   }
+   
+   string values[];
+   int count = StringSplit(ManualHedgePips, ',', values);
+   ArrayResize(manualHedgePipsArray, count);
+   
+   for(int i = 0; i < count; i++) {
+      manualHedgePipsArray[i] = StringToDouble(values[i]);
+   }
+   Log(StringFormat("Parsed %d manual hedge pip levels", count));
+}
+
+//+------------------------------------------------------------------+
+//| Generate manual lot sequence                                     |
+//+------------------------------------------------------------------+
+void GenerateManualLotSequence()
+{
+   if(ManualInitialLotSize <= 0 || ManualLotMultiplier <= 0) {
+      Log("Error: Invalid manual lot settings. Using main sequence");
+      ArrayResize(manualLotSequence, 0);
+      return;
+   }
+   
+   ArrayResize(manualLotSequence, MaxTrades-1);
+   double currentLot = ManualInitialLotSize;
+   
+   for(int i = 0; i < MaxTrades-1; i++) {
+      manualLotSequence[i] = NormalizeDouble(currentLot, 2);
+      currentLot *= ManualLotMultiplier;
+   }
+   Log(StringFormat("Generated manual lot sequence: %d entries", MaxTrades-1));
 }
 
 //+------------------------------------------------------------------+
@@ -446,6 +505,12 @@ int OnInit()
    
    // Generate reverse lot sequence
    GenerateReverseLotSequence();
+   
+   // Parse manual hedge pip values
+   ParseManualHedgePips();
+   
+   // Generate manual lot sequence
+   GenerateManualLotSequence();
    
    // Check for manual trades on startup
    if(IncorporateManualTrades) {
@@ -723,7 +788,7 @@ void DisplayTradingInfo()
    }
    
    // Create background panel
-   int panelHeight = 300;
+   int panelHeight = 320;
    if(ObjectFind(0, "Panel_BG") < 0) {
       ObjectCreate(0, "Panel_BG", OBJ_RECTANGLE_LABEL, 0, 0, 0);
       ObjectSetInteger(0, "Panel_BG", OBJPROP_CORNER, CORNER_LEFT_UPPER);
@@ -748,7 +813,7 @@ void DisplayTradingInfo()
    int col1 = 15;
 
    // Header
-   CreatePanelObject("Panel_Header", "RALLY TRACKER PRO v5.0", col1, y, HeaderColor, FontSize+2);
+   CreatePanelObject("Panel_Header", "RALLY TRACKER PRO v5.2", col1, y, HeaderColor, FontSize+2);
    y += lineHeight;
    
    // IST Time
@@ -761,6 +826,14 @@ void DisplayTradingInfo()
    
    // EA Status
    CreatePanelObject("Panel_Status", "• Status: " + currentStatus, col1, y, ValueColor, FontSize);
+   y += lineHeight;
+   
+   // Trading Type
+   string tradeType = "• Trading Type: ";
+   if(HedgeOnClose) tradeType += "Candle Close";
+   else if(ArraySize(manualHedgePipsArray) > 0) tradeType += StringFormat("Manual (%d levels)", ArraySize(manualHedgePipsArray));
+   else tradeType += "Not Set";
+   CreatePanelObject("Panel_TradeType", tradeType, col1, y, clrCornflowerBlue, FontSize);
    y += lineHeight;
    
    // Main Trades Count
@@ -944,7 +1017,7 @@ bool CheckEmergencyStop()
 
 //+------------------------------------------------------------------+
 //| Calculate dynamic profit target based on hedge count             |
-//+------------------------------------------------------------------+
+//+极------------------------------------------------------------------+
 double CalculateProfitTarget()
 {
    if(sameDirectionCount <= 1) return 0; // No target for single trade
@@ -954,7 +1027,7 @@ double CalculateProfitTarget()
    else if(sameDirectionCount == 3)
       return 0.4 * ProfitTargetUSD;
    else if(sameDirectionCount == 4)
-      return 0.5 * ProfitTargetUSD;
+      return 0.5 * Profit极USD;
    else if(sameDirectionCount == 5)
       return 0.8 * ProfitTargetUSD;
    else if(sameDirectionCount >= 6 && sameDirectionCount <= 9)
@@ -1085,24 +1158,53 @@ void ManageHedging()
       useDrawdownNow = UseDrawdownCondition && IsDrawdownTime();
    }
    
-   // Strict price progression condition
-   bool priceCondition = false;
-   if(direction == 1) {
-      priceCondition = (currentPrice < lastMainEntryPrice);
-   }
-   else if(direction == -1) {
-      priceCondition = (currentPrice > lastMainEntryPrice);
-   }
-
-   // Updated condition check with price progression
+   // Determine which hedge condition to use
    bool conditionMet = false;
-   if(direction == 1) {
-      conditionMet = (prevClose < lastMainEntryPrice) && priceCondition && 
-                     (!useDrawdownNow || (useDrawdownNow && drawdownPips >= MaxHedgeDrawdownPips));
+   string conditionType = "";
+   double requiredPips = 0;
+   
+   // Condition 1: Candle Close Method
+   if(HedgeOnClose) {
+      if(direction == 1) {
+         conditionMet = (prevClose < lastMainEntryPrice) && (currentPrice < lastMain极Price);
+      } else {
+         conditionMet = (prevClose > lastMainEntryPrice) && (currentPrice > lastMainEntryPrice);
+      }
+      conditionType = "Candle Close";
    }
-   else if(direction == -1) {
-      conditionMet = (prevClose > lastMainEntryPrice) && priceCondition && 
-                     (!useDrawdownNow || (useDrawdownNow && drawdownPips >= MaxHedgeDrawdownPips));
+   // Condition 2: Manual Pips Method
+   else if(ArraySize(manualHedgePipsArray) > 0) 
+   {
+      int pipIndex = MathMin(sameDirectionCount-1, ArraySize(manualHedgePipsArray)-1);
+      requiredPips = manualHedgePipsArray[pipIndex];
+      conditionMet = (drawdownPips >= requiredPips);
+      conditionType = StringFormat("Manual Pips (%.1f/%.1f)", drawdownPips, requiredPips);
+   }
+   else {
+      Log("Warning: No hedge method selected!");
+      return;
+   }
+   
+   // Apply EMA filter for manual hedge if enabled
+   if(!HedgeOnClose && ManualUseEMAFilter && UseEMAFilter) {
+      double emaValue = GetEMAValue();
+      if(emaValue == 0) {
+         conditionMet = false;
+         Log("Manual hedge blocked: EMA value invalid");
+      } else {
+         if(direction == 1 && currentPrice < emaValue) {
+            conditionMet = false;
+            Log(StringFormat("Manual hedge blocked: Price %.5f < EMA %.5f", currentPrice, emaValue));
+         } else if(direction == -1 && currentPrice > emaValue) {
+            conditionMet = false;
+            Log(StringFormat("Manual hedge blocked: Price %.5f > EMA %.5f", currentPrice, emaValue));
+         }
+      }
+   }
+   
+   // Apply drawdown filter if enabled
+   if(conditionMet && useDrawdownNow) {
+      conditionMet = (drawdownPips >= MaxHedgeDrawdownPips);
    }
 
    if(conditionMet)
@@ -1116,38 +1218,76 @@ void ManageHedging()
       if(lastHedgeTime == currentBarTime) return;
       
       double lot = 0;
-      int arraySize = ArraySize(lotSequence);
+      double tpPrice = 0;
+      double pointValue = GetCurrentPoint();
       
-      // SAFEGUARDED LOT CALCULATION
-      if(arraySize > 0) {
-         if(sameDirectionCount-1 < arraySize) {
-            lot = lotSequence[sameDirectionCount-1];
+      // Get lot size based on hedge type
+      if(HedgeOnClose) {
+         // Main sequence lot size
+         int arraySize = ArraySize(lotSequence);
+         if(arraySize > 0) {
+            if(sameDirectionCount-1 < arraySize) {
+               lot = lotSequence[sameDirectionCount-1];
+            } else {
+               lot = lotSequence[arraySize-1];
+            }
+         } else {
+            lot = InitialLotSize * MathPow(LotMultiplier, sameDirectionCount-1);
+            lot = NormalizeDouble(lot, 2);
          }
-         else {
-            lot = lotSequence[arraySize-1]; // Use last valid element
+      } else {
+         // Manual hedge lot size
+         if(ArraySize(manualLotSequence) > 0 && sameDirectionCount-1 < ArraySize(manualLotSequence)) {
+            lot = manualLotSequence[sameDirectionCount-1];
+         } else if(ArraySize(manualLotSequence) > 0) {
+            lot = manualLotSequence[ArraySize(manualLotSequence)-1];
+         } else {
+            // Fallback to main sequence if manual sequence not available
+            int arraySize = ArraySize(lotSequence);
+            if(arraySize > 0) {
+               if(sameDirectionCount-1 < arraySize) {
+                  lot = lotSequence[sameDirectionCount-1];
+               } else {
+                  lot = lotSequence[arraySize-1];
+               }
+            } else {
+               lot = InitialLotSize * MathPow(LotMultiplier, sameDirectionCount-1);
+               lot = NormalizeDouble(lot, 2);
+            }
          }
-      }
-      else {
-         lot = InitialLotSize * MathPow(LotMultiplier, sameDirectionCount-1);
-         lot = NormalizeDouble(lot, 2);
+         
+         // Calculate TP if enabled
+         if(ManualHedgeTPPips > 0) {
+            if(direction == 1) {
+               tpPrice = currentPrice + ManualHedgeTPPips * PIP * pointValue;
+            } else {
+               tpPrice = currentPrice - ManualHedgeTPPips * PIP * pointValue;
+            }
+         }
       }
       
       trade.SetExpertMagicNumber(MagicNumber);
       if(trade.PositionOpen(currentSymbol, direction == 1 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,
-                         lot, currentPrice, 0, 0, "Rally_Hedge"))
+                         lot, currentPrice, 0, tpPrice, "Rally_Hedge"))
       {
-         Log(StringFormat("Opened Main Hedge #%d: %s %.2f lots @ %.5f",
+         Log(StringFormat("Opened %s Hedge #%d (%s): %s %.2f lots @ %.5f %s",
+                         HedgeOnClose ? "Main" : "Manual",
                          sameDirectionCount,
+                         conditionType,
                          (direction == 1) ? "BUY" : "SELL",
                          lot,
-                         currentPrice));
+                         currentPrice,
+                         (tpPrice > 0) ? StringFormat("(TP: %.5f)", tpPrice) : ""));
                          
          // Update counters and prices
          sameDirectionCount++;
          lastMainEntryPrice = currentPrice;
          lastHedgeTime = currentBarTime;
          dailyTrades++;
-         currentStatus = StringFormat("Opened Main Hedge #%d @ %.5f", sameDirectionCount-1, currentPrice);
+         currentStatus = StringFormat("Opened %s Hedge #%d @ %.5f", 
+                                     HedgeOnClose ? "Main" : "Manual", 
+                                     sameDirectionCount-1, 
+                                     currentPrice);
          Log("Status: " + currentStatus);
          
          // Remove TP from initial trade after first hedge
@@ -1178,17 +1318,22 @@ void ManageHedging()
    {
       // Detailed condition logging
       string logMsg = "Hedge condition not met: ";
-      if(direction == 1) {
-         logMsg += StringFormat("Need price < %.5f (current: %.5f), ", lastMainEntryPrice, currentPrice);
-         logMsg += StringFormat("PrevClose %.5f %s lastPrice", prevClose, prevClose < lastMainEntryPrice ? "<" : ">=");
+      if(HedgeOnClose) {
+         if(direction == 1) {
+            logMsg += StringFormat("Need price < %.5f (current: %.5f), ", lastMainEntryPrice, currentPrice);
+            logMsg += StringFormat("PrevClose %.5f %s lastPrice", prevClose, prevClose < lastMainEntryPrice ? "<" : ">=");
+         }
+         else {
+            logMsg += StringFormat("Need price > %.5f (current: %.5f), ", lastMainEntryPrice, currentPrice);
+            logMsg += StringFormat("PrevClose %.5f %s lastPrice", prevClose, prevClose > lastMainEntryPrice ? ">" : "<=");
+         }
       }
-      else {
-         logMsg += StringFormat("Need price > %.5f (current: %.5f), ", lastMainEntryPrice, currentPrice);
-         logMsg += StringFormat("PrevClose %.5f %s lastPrice", prevClose, prevClose > lastMainEntryPrice ? ">" : "<=");
+      else if(ArraySize(manualHedgePipsArray) > 0) {
+         logMsg += StringFormat("Drawdown: %.1f/%.1f pips", drawdownPips, requiredPips);
       }
       
       if(useDrawdownNow) {
-         logMsg += StringFormat(", Drawdown: %.1f/%d pips", drawdownPips, MaxHedgeDrawdownPips);
+         logMsg += StringFormat(", MaxDrawdown: %d pips", MaxHedgeDrawdownPips);
       }
       Log(logMsg);
    }
@@ -1293,7 +1438,7 @@ void ManageReverseHedging()
    {
       // Get reverse lot size
       double lot = (reverseTradeCount < ArraySize(reverseLotSequence)) 
-                  ? reverseLotSequence[reverseTradeCount] 
+                  ? reverseLotSequence[reverse极Count] 
                   : NormalizeDouble(ReverseInitialLotSize * MathPow(ReverseLotMultiplier, reverseTradeCount), 2);
       
       // Set CORRECT OPPOSITE direction
@@ -1637,7 +1782,7 @@ void OnTick()
          // Verify direction matches EMA filter
          if(UseEMAFilter && direction != emaDirection) {
             currentStatus = "Direction doesn't match EMA";
-            Log("Status: " + currentStatus);
+            Log("Status: " + current极);
             return;
          }
          
