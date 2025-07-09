@@ -1,9 +1,9 @@
 //+------------------------------------------------------------------+
-//| Expert Advisor: Rally Tracker Pro - Enhanced Edition             |
+//| Expert Advisor: Candle Pro - Enhanced Edition             |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2023, Rally Tracker Pro"
-#property link      "www.rallytracker.com"
-#property version   "5.0"
+#property link      "www.cadlepro.com"
+#property version   "17"
 #property strict
 
 //===========================================
