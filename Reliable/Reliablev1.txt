@@ -1,9 +1,9 @@
 //+------------------------------------------------------------------+
-//| Expert Advisor: Candle Pro - Enhanced Edition             |
+//| Expert Advisor: Reliable v1                                      |
 //+------------------------------------------------------------------+
-#property copyright "Copyright 2023, Rally Tracker Pro"
-#property link      "www.cadlepro.com"
-#property version   "17"
+#property copyright "Copyright 2024, Reliable Trading Systems"
+#property link      "www.reliablesystems.com"
+#property version   "001.000"
 #property strict
 
 //===========================================
@@ -18,7 +18,7 @@ input bool     EnableEquityStop        = false;       // Enable equity stop prot
 input double   MaxEquityDrawdownPercent = 20.0;       // Max allowed equity drawdown percentage
 input int      MaxSlippagePips         = 5;           // Maximum allowed slippage in pips
 input bool     IncorporateManualTrades = true;        // Incorporate manual trades into EA management
-input string   NotificationPhoneNumber = "+919890078696";  // Phone number for SMS alerts
+input string   NotificationPhoneNumber = "";          // Phone number for SMS alerts
 
 //===========================================
 //          Initial Trade Settings
@@ -42,6 +42,7 @@ input int      MaxTrades               = 30;          // Maximum trades allowed
 input double   ProfitTargetUSD         = 10.0;        // Base profit target in account currency
 input bool     UseDrawdownCondition    = true;        // Enable drawdown condition for hedging
 input int      MaxHedgeDrawdownPips    = 200;         // Minimum drawdown (pips) required to hedge
+input string   HedgeDrawdownPips       = "700,1400,2100,2800,3500,4200,5600"; // Manual pips per hedge (comma separated)
 
 //===========================================
 //        Alternate Hedge Settings
@@ -68,6 +69,15 @@ input double   ReverseLotMultiplier    = 1.5;         // Multiplier for reverse 
 input double   ReverseInitialLotSize   = 0.01;        // Initial lot size for reverse hedge
 input int      MaxReverseTrades        = 25;          // Maximum reverse trades allowed
 input int      ReverseHedgeTPPips      = 500;         // Take profit for reverse hedges in pips
+
+//===========================================
+//        Dynamic Trailing Settings
+//===========================================
+input string   TrailingSettings        = "------ Dynamic Trailing Settings ------";
+input bool     EnableGroupTrailing     = true;        // Enable group trailing SL
+input double   BaseProfitPerTrade      = 5.0;         // Base profit per trade to activate trailing
+input double   TrailingStepUSD         = 1.0;         // Profit increment to move SL
+input double   MinTrailingDistanceUSD  = 2.0;         // Minimum distance from current profit
 
 //===========================================
 //             Time Settings
@@ -150,6 +160,13 @@ CPositionInfo positionInfo;
 CAccountInfo accountInfo;
 CHistoryOrderInfo historyOrder;
 
+// Trade comment identifiers
+#define INITIAL_COMMENT "Reliable_Initial"
+#define HEDGE_COMMENT   "Reliable_Hedge"
+#define ALT_COMMENT     "Reliable_Alt"
+#define REVERSE_COMMENT "Reliable_Reverse"
+#define MANUAL_COMMENT  "Reliable_Manual"
+
 // Global Variables
 int direction = 0;                  // 1 for Buy, -1 for Sell
 bool initialTradeOpened = false;    // Flag for initial trade
@@ -186,6 +203,13 @@ double winRate = 0;                 // Win rate percentage
 double riskRewardRatio = 0;         // Risk-reward ratio
 string currentSymbol;               // Symbol being traded
 bool manualTradeDetected = false;   // Flag for detected manual trades
+int manualDrawdownPips[];           // Array for manual drawdown pips
+bool useManualDrawdown = false;     // Flag to use manual drawdown values
+int currentRequiredDrawdown = 0;    // Current required drawdown for next hedge
+double groupTrailingLevel = 0;      // Current trailing SL level
+double peakGroupProfit = 0;         // Highest profit achieved
+bool trailingActive = false;        // Trailing state flag
+double activationLevel = 0;         // Current activation level for trailing
 
 //+------------------------------------------------------------------+
 //| Safe Point Value Retrieval                                       |
@@ -256,15 +280,15 @@ void SendStatusNotification(string message)
     
     // Standard notification
     #ifdef __MQL5__
-        SendNotification("RallyTracker: " + message);
+        SendNotification("Reliable: " + message);
         // Phone number notification
         if(NotificationPhoneNumber != "") {
-            SendNotification("Gold Rocket" + NotificationPhoneNumber);
+            SendNotification("Reliable" + NotificationPhoneNumber);
         }
     #else
-        Alert("RallyTracker: " + message);
+        Alert("Reliable: " + message);
         if(NotificationPhoneNumber != "") {
-            Alert("Gold Rocket" + NotificationPhoneNumber);
+            Alert("Reliable" + NotificationPhoneNumber);
         }
     #endif
     
@@ -403,6 +427,11 @@ int OnInit()
    riskRewardRatio = 0;
    lastDailyReset = iTime(currentSymbol, PERIOD_D1, 0);
    manualTradeDetected = false;
+   currentRequiredDrawdown = MaxHedgeDrawdownPips;
+   groupTrailingLevel = 0;
+   peakGroupProfit = 0;
+   trailingActive = false;
+   activationLevel = 0;
    
    // Set slippage
    trade.SetDeviationInPoints(MaxSlippagePips * PIP);
@@ -447,13 +476,28 @@ int OnInit()
    // Generate reverse lot sequence
    GenerateReverseLotSequence();
    
+   // Process manual drawdown configuration
+   if(StringLen(HedgeDrawdownPips) > 0) {
+      useManualDrawdown = true;
+      string temp[];
+      int count = StringSplit(HedgeDrawdownPips, ',', temp);
+      ArrayResize(manualDrawdownPips, count);
+      for(int i = 0; i < count; i++) {
+         manualDrawdownPips[i] = (int)StringToInteger(temp[i]);
+      }
+      Log(StringFormat("Manual drawdown sequence parsed: %d entries", count));
+      
+      // Set initial required drawdown
+      if(count > 0) currentRequiredDrawdown = manualDrawdownPips[0];
+   }
+   
    // Check for manual trades on startup
    if(IncorporateManualTrades) {
       CheckManualTrades();
    }
    
    if(StringLen(NotificationPhoneNumber) > 5) {
-      Log("SMS alerts enabled for: Gold Rocket" + NotificationPhoneNumber);
+      Log("SMS alerts enabled for: Reliable" + NotificationPhoneNumber);
    }
    
    Log("Status: EA initialization complete - Waiting for market conditions");
@@ -611,7 +655,7 @@ void ManageAltHedgeTrailing()
       ulong ticket = PositionGetTicket(i);
       if(ticket == 0) continue;
       if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
-      if(PositionGetString(POSITION_COMMENT) != "Rally_Alt") continue;
+      if(PositionGetString(POSITION_COMMENT) != ALT_COMMENT) continue;
       
       double currentProfit = PositionGetDouble(POSITION_PROFIT);
       double currentPrice = PositionGetDouble(POSITION_PRICE_CURRENT);
@@ -723,7 +767,7 @@ void DisplayTradingInfo()
    }
    
    // Create background panel
-   int panelHeight = 300;
+   int panelHeight = 320;
    if(ObjectFind(0, "Panel_BG") < 0) {
       ObjectCreate(0, "Panel_BG", OBJ_RECTANGLE_LABEL, 0, 0, 0);
       ObjectSetInteger(0, "Panel_BG", OBJPROP_CORNER, CORNER_LEFT_UPPER);
@@ -748,7 +792,7 @@ void DisplayTradingInfo()
    int col1 = 15;
 
    // Header
-   CreatePanelObject("Panel_Header", "RALLY TRACKER PRO v5.0", col1, y, HeaderColor, FontSize+2);
+   CreatePanelObject("Panel_Header", "RELIABLE V1", col1, y, HeaderColor, FontSize+2);
    y += lineHeight;
    
    // IST Time
@@ -797,6 +841,30 @@ void DisplayTradingInfo()
    string manualStatus = "• Manual Trade: " + string(manualTradeDetected ? "Incorporated" : "None");
    CreatePanelObject("Panel_Manual", manualStatus, col1, y, manualTradeDetected ? clrLime : clrSilver, FontSize);
    y += lineHeight;
+   
+   // Drawdown Settings
+   string drawdownMode = useManualDrawdown ? "Custom" : "Fixed";
+   CreatePanelObject("Panel_Drawdown", "• Drawdown: " + drawdownMode + " " + IntegerToString(currentRequiredDrawdown) + " pips", col1, y, ValueColor, FontSize);
+   y += lineHeight;
+   
+   // Trailing Status
+   string trailingStatus = "• Group Trailing: " + string(trailingActive ? "ACTIVE" : "Inactive");
+   CreatePanelObject("Panel_Trailing", trailingStatus, col1, y, trailingActive ? clrLime : clrSilver, FontSize);
+   y += lineHeight;
+   
+   // Dynamic Target Display
+   if(EnableGroupTrailing && sameDirectionCount > 0) {
+      activationLevel = BaseProfitPerTrade * sameDirectionCount;
+      string targetText = StringFormat("• Dynamic Target: $%.2f", activationLevel);
+      CreatePanelObject("Panel_DynamicTarget", targetText, col1, y, clrDodgerBlue, FontSize);
+      y += lineHeight;
+      
+      if(trailingActive) {
+         string trailingText = StringFormat("• Trailing SL: $%.2f", groupTrailingLevel);
+         CreatePanelObject("Panel_TrailingLevel", trailingText, col1, y, clrOrange, FontSize);
+         y += lineHeight;
+      }
+   }
    
    // Last Log Message
    string shortLog = StringSubstr(lastLogMessage, 0, 50);
@@ -1048,12 +1116,12 @@ bool CheckStrictConsecutiveCandles(int &dir)
 }
 
 //+------------------------------------------------------------------+
-//| Modified Hedge Logic with Alternate Hedge Feature                |
+//| Modified Hedge Logic with Manual Drawdown Feature                |
 //+------------------------------------------------------------------+
 void ManageHedging()
 {
    // Skip if hedging is disabled
-   if(!EnableHedges) return;
+   if(!EnableHedges || !EnableHedging) return;
    
    // Check if we're on a new candle
    static datetime lastBarTime = 0;
@@ -1085,6 +1153,22 @@ void ManageHedging()
       useDrawdownNow = UseDrawdownCondition && IsDrawdownTime();
    }
    
+   // Calculate required drawdown based on hedge count
+   int requiredDrawdown = MaxHedgeDrawdownPips;
+   if(useManualDrawdown) {
+      int hedgeIndex = sameDirectionCount - 1; // First hedge is index 0
+      if(hedgeIndex < ArraySize(manualDrawdownPips)) {
+         requiredDrawdown = manualDrawdownPips[hedgeIndex];
+      }
+      else if(ArraySize(manualDrawdownPips) > 0) {
+         // Use last value if beyond array size
+         requiredDrawdown = manualDrawdownPips[ArraySize(manualDrawdownPips)-1];
+      }
+   }
+   
+   // Update global variable for display
+   currentRequiredDrawdown = requiredDrawdown;
+
    // Strict price progression condition
    bool priceCondition = false;
    if(direction == 1) {
@@ -1098,11 +1182,11 @@ void ManageHedging()
    bool conditionMet = false;
    if(direction == 1) {
       conditionMet = (prevClose < lastMainEntryPrice) && priceCondition && 
-                     (!useDrawdownNow || (useDrawdownNow && drawdownPips >= MaxHedgeDrawdownPips));
+                     (!useDrawdownNow || (useDrawdownNow && drawdownPips >= requiredDrawdown));
    }
    else if(direction == -1) {
       conditionMet = (prevClose > lastMainEntryPrice) && priceCondition && 
-                     (!useDrawdownNow || (useDrawdownNow && drawdownPips >= MaxHedgeDrawdownPips));
+                     (!useDrawdownNow || (useDrawdownNow && drawdownPips >= requiredDrawdown));
    }
 
    if(conditionMet)
@@ -1134,13 +1218,15 @@ void ManageHedging()
       
       trade.SetExpertMagicNumber(MagicNumber);
       if(trade.PositionOpen(currentSymbol, direction == 1 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,
-                         lot, currentPrice, 0, 0, "Rally_Hedge"))
+                         lot, currentPrice, 0, 0, HEDGE_COMMENT))
       {
-         Log(StringFormat("Opened Main Hedge #%d: %s %.2f lots @ %.5f",
+         Log(StringFormat("Opened Main Hedge #%d: %s %.2f lots @ %.5f (Drawdown: %.1f/%d pips)",
                          sameDirectionCount,
                          (direction == 1) ? "BUY" : "SELL",
                          lot,
-                         currentPrice));
+                         currentPrice,
+                         drawdownPips,
+                         requiredDrawdown));
                          
          // Update counters and prices
          sameDirectionCount++;
@@ -1188,7 +1274,7 @@ void ManageHedging()
       }
       
       if(useDrawdownNow) {
-         logMsg += StringFormat(", Drawdown: %.1f/%d pips", drawdownPips, MaxHedgeDrawdownPips);
+         logMsg += StringFormat(", Drawdown: %.1f/%d pips", drawdownPips, requiredDrawdown);
       }
       Log(logMsg);
    }
@@ -1230,7 +1316,7 @@ void OpenAlternateHedge()
    
    trade.SetExpertMagicNumber(MagicNumber);
    if(trade.PositionOpen(currentSymbol, direction == 1 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,
-                      AlternateLotSize, currentPrice, 0, tpPrice, "Rally_Alt"))
+                      AlternateLotSize, currentPrice, 0, tpPrice, ALT_COMMENT))
    {
       // Add price to tracking array
       ArrayResize(alternateHedgePrices, ArraySize(alternateHedgePrices)+1);
@@ -1311,7 +1397,7 @@ void ManageReverseHedging()
       
       // Execute trade
       trade.SetExpertMagicNumber(MagicNumber);
-      if(trade.PositionOpen(currentSymbol, tradeType, lot, currentPrice, 0, tpPrice, "Rally_Reverse"))
+      if(trade.PositionOpen(currentSymbol, tradeType, lot, currentPrice, 0, tpPrice, REVERSE_COMMENT))
       {
          // Update counters and prices
          reverseTradeCount++;
@@ -1416,7 +1502,7 @@ int CountManualTrades()
         if(ticket <= 0) continue;
         
         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber && 
-           PositionGetString(POSITION_COMMENT) == "Rally_Manual")
+           PositionGetString(POSITION_COMMENT) == MANUAL_COMMENT)
         {
             count++;
         }
@@ -1438,11 +1524,11 @@ int CountOpenEATrades()
       if(PositionGetInteger(POSITION_MAGIC) == MagicNumber)
       {
          string comment = PositionGetString(POSITION_COMMENT);
-         if(comment == "Rally_Initial" || 
-            comment == "Rally_Hedge" || 
-            comment == "Rally_Alt" || 
-            comment == "Rally_Reverse" ||
-            comment == "Rally_Manual")
+         if(comment == INITIAL_COMMENT || 
+            comment == HEDGE_COMMENT || 
+            comment == ALT_COMMENT || 
+            comment == REVERSE_COMMENT ||
+            comment == MANUAL_COMMENT)
          {
             count++;
          }
@@ -1499,6 +1585,12 @@ bool CloseAllEATrades()
       inHaltPeriod = true;
       initialBarTime = 0;  // Reset initial bar time
       Log(StringFormat("%d second halt period activated", HaltPeriodSeconds));
+      
+      // Reset trailing stop
+      trailingActive = false;
+      groupTrailingLevel = 0;
+      peakGroupProfit = 0;
+      activationLevel = 0;
       
       return true;
    }
@@ -1603,6 +1695,48 @@ void OnTick()
 
    int totalEATrades = CountOpenEATrades();
    bool hasManualTrade = CountManualTrades() > 0;
+   double totalProfit = GetTotalEAUnrealizedProfit();
+   
+   // DYNAMIC TRAILING STOP LOGIC (UPDATED)
+   if(EnableGroupTrailing && totalEATrades > 0 && sameDirectionCount > 0) 
+   {
+      // Calculate dynamic profit target based on trade count
+      activationLevel = BaseProfitPerTrade * sameDirectionCount;
+      
+      if(totalProfit >= activationLevel) 
+      {
+         if(!trailingActive) 
+         {
+            // Activate trailing when dynamic target is hit
+            trailingActive = true;
+            peakGroupProfit = totalProfit;
+            groupTrailingLevel = activationLevel - MinTrailingDistanceUSD;
+            Log(StringFormat("Trailing SL ACTIVATED at $%.2f (Target: $%.2f for %d trades)", 
+                             groupTrailingLevel, activationLevel, sameDirectionCount));
+         }
+         else 
+         {
+            // Move SL when profit increases by step amount
+            if(totalProfit > peakGroupProfit + TrailingStepUSD) 
+            {
+               groupTrailingLevel = peakGroupProfit - MinTrailingDistanceUSD;
+               peakGroupProfit = totalProfit;
+               Log(StringFormat("Trailing SL MOVED to $%.2f", groupTrailingLevel));
+            }
+            
+            // Close positions if profit falls to trailing level
+            if(totalProfit <= groupTrailingLevel) 
+            {
+               if(CloseAllEATrades()) 
+               {
+                  Log(StringFormat("Trailing SL TRIGGERED at $%.2f", groupTrailingLevel));
+                  SendStatusNotification("Group trailing stop triggered: $" + DoubleToString(totalProfit, 2));
+                  trailingActive = false;
+               }
+            }
+         }
+      }
+   }
    
    if(totalEATrades == 0 && !hasManualTrade)
    {
@@ -1611,6 +1745,8 @@ void OnTick()
       reverseTradeCount = 0;
       initialTradeOpened = false;
       initialBarTime = 0;  // Reset initial bar time
+      trailingActive = false; // Reset trailing flag
+      activationLevel = 0;
       
       // Skip initial trades if disabled
       if(!EnableInitialTrades) {
@@ -1654,7 +1790,7 @@ void OnTick()
          
          trade.SetExpertMagicNumber(MagicNumber);
          if(trade.PositionOpen(currentSymbol, direction == 1 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,
-                              lotSize, initialEntryPrice, 0, tpPrice, "Rally_Initial"))
+                              lotSize, initialEntryPrice, 0, tpPrice, INITIAL_COMMENT))
          {
             Log(StringFormat("Opened Initial Trade: %s %.2f lots @ %.5f (TP: %.5f)",
                             (direction == 1) ? "BUY" : "SELL",
@@ -1688,16 +1824,20 @@ void OnTick()
    else
    {
       // Create detailed status message
-      double totalProfit = GetTotalEAUnrealizedProfit();
-      double target = CalculateProfitTarget();
       string statusDetails = StringFormat("Managing %d trades: %d main, %d reverse | P/L: $%.2f",
                                         totalEATrades,
                                         sameDirectionCount,
                                         reverseTradeCount,
                                         totalProfit);
-                                        
-      if(target > 0) {
-         statusDetails += StringFormat(" | Target: $%.2f", target);
+      
+      // Add dynamic target to status if enabled
+      if(EnableGroupTrailing && sameDirectionCount > 0) {
+         activationLevel = BaseProfitPerTrade * sameDirectionCount;
+         statusDetails += StringFormat(" | Target: $%.2f", activationLevel);
+      }
+      
+      if(trailingActive) {
+         statusDetails += StringFormat(" | Trailing SL: $%.2f", groupTrailingLevel);
       }
       
       if(hasManualTrade) {
@@ -1711,7 +1851,7 @@ void OnTick()
       }
       
       // Continue managing existing sequence
-      if(EnableHedging && sameDirectionCount < MaxTrades) {
+      if(EnableHedges && sameDirectionCount < MaxTrades) {
          ManageHedging();
       }
       
@@ -1719,26 +1859,18 @@ void OnTick()
          ManageReverseHedging();
       }
       
-      // Always check profit target
-      if(target > 0 && totalProfit >= target) {
-         if(CloseAllEATrades()) {
-            Log(StringFormat("Profit target reached! Closed %d positions. Profit: $%.2f", 
-                            totalEATrades, 
-                            totalProfit));
-                            
-            currentStatus = StringFormat("Profit target ($%.2f) reached! Closed all positions", target);
-            Log("Status: " + currentStatus);
-            SendStatusNotification(currentStatus);
-            
-            // Reset sequence
-            initialTradeOpened = false;
-            initialEntryPrice = 0;
-            sameDirectionCount = 0;
-            reverseTradeCount = 0;
-            manualTradeDetected = false;
-         }
-         else {
-            Log("Failed to close positions for profit target!");
+      // Static profit closure (only if trailing is disabled)
+      if(!EnableGroupTrailing) {
+         double target = CalculateProfitTarget();
+         if(target > 0 && totalProfit >= target) {
+            if(CloseAllEATrades()) {
+               Log(StringFormat("Profit target reached! Closed %d positions. Profit: $%.2f", 
+                               totalEATrades, 
+                               totalProfit));
+               currentStatus = StringFormat("Profit target ($%.2f) reached! Closed all positions", target);
+               Log("Status: " + currentStatus);
+               SendStatusNotification(currentStatus);
+            }
          }
       }
    }

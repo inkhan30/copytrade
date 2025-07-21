@@ -42,6 +42,7 @@ input int      MaxTrades               = 30;          // Maximum trades allowed
 input double   ProfitTargetUSD         = 10.0;        // Base profit target in account currency
 input bool     UseDrawdownCondition    = true;        // Enable drawdown condition for hedging
 input int      MaxHedgeDrawdownPips    = 200;         // Minimum drawdown (pips) required to hedge
+input string   HedgeDrawdownPips       = "700,1400,2100,2800,3500,4200,5600"; // Manual pips per hedge (comma separated)
 
 //===========================================
 //        Alternate Hedge Settings
@@ -186,6 +187,9 @@ double winRate = 0;                 // Win rate percentage
 double riskRewardRatio = 0;         // Risk-reward ratio
 string currentSymbol;               // Symbol being traded
 bool manualTradeDetected = false;   // Flag for detected manual trades
+int manualDrawdownPips[];           // Array for manual drawdown pips
+bool useManualDrawdown = false;     // Flag to use manual drawdown values
+int currentRequiredDrawdown = 0;    // Current required drawdown for next hedge
 
 //+------------------------------------------------------------------+
 //| Safe Point Value Retrieval                                       |
@@ -403,6 +407,7 @@ int OnInit()
    riskRewardRatio = 0;
    lastDailyReset = iTime(currentSymbol, PERIOD_D1, 0);
    manualTradeDetected = false;
+   currentRequiredDrawdown = MaxHedgeDrawdownPips;
    
    // Set slippage
    trade.SetDeviationInPoints(MaxSlippagePips * PIP);
@@ -446,6 +451,21 @@ int OnInit()
    
    // Generate reverse lot sequence
    GenerateReverseLotSequence();
+   
+   // Process manual drawdown configuration
+   if(StringLen(HedgeDrawdownPips) > 0) {
+      useManualDrawdown = true;
+      string temp[];
+      int count = StringSplit(HedgeDrawdownPips, ',', temp);
+      ArrayResize(manualDrawdownPips, count);
+      for(int i = 0; i < count; i++) {
+         manualDrawdownPips[i] = (int)StringToInteger(temp[i]);
+      }
+      Log(StringFormat("Manual drawdown sequence parsed: %d entries", count));
+      
+      // Set initial required drawdown
+      if(count > 0) currentRequiredDrawdown = manualDrawdownPips[0];
+   }
    
    // Check for manual trades on startup
    if(IncorporateManualTrades) {
@@ -798,6 +818,11 @@ void DisplayTradingInfo()
    CreatePanelObject("Panel_Manual", manualStatus, col1, y, manualTradeDetected ? clrLime : clrSilver, FontSize);
    y += lineHeight;
    
+   // Drawdown Settings
+   string drawdownMode = useManualDrawdown ? "Custom" : "Fixed";
+   CreatePanelObject("Panel_Drawdown", "• Drawdown: " + drawdownMode + " " + IntegerToString(currentRequiredDrawdown) + " pips", col1, y, ValueColor, FontSize);
+   y += lineHeight;
+   
    // Last Log Message
    string shortLog = StringSubstr(lastLogMessage, 0, 50);
    CreatePanelObject("Panel_LastLog", "• Last Log: " + shortLog, col1, y, clrSilver, FontSize-1);
@@ -1048,7 +1073,7 @@ bool CheckStrictConsecutiveCandles(int &dir)
 }
 
 //+------------------------------------------------------------------+
-//| Modified Hedge Logic with Alternate Hedge Feature                |
+//| Modified Hedge Logic with Manual Drawdown Feature                |
 //+------------------------------------------------------------------+
 void ManageHedging()
 {
@@ -1085,6 +1110,22 @@ void ManageHedging()
       useDrawdownNow = UseDrawdownCondition && IsDrawdownTime();
    }
    
+   // Calculate required drawdown based on hedge count
+   int requiredDrawdown = MaxHedgeDrawdownPips;
+   if(useManualDrawdown) {
+      int hedgeIndex = sameDirectionCount - 1; // First hedge is index 0
+      if(hedgeIndex < ArraySize(manualDrawdownPips)) {
+         requiredDrawdown = manualDrawdownPips[hedgeIndex];
+      }
+      else if(ArraySize(manualDrawdownPips) > 0) {
+         // Use last value if beyond array size
+         requiredDrawdown = manualDrawdownPips[ArraySize(manualDrawdownPips)-1];
+      }
+   }
+   
+   // Update global variable for display
+   currentRequiredDrawdown = requiredDrawdown;
+
    // Strict price progression condition
    bool priceCondition = false;
    if(direction == 1) {
@@ -1098,11 +1139,11 @@ void ManageHedging()
    bool conditionMet = false;
    if(direction == 1) {
       conditionMet = (prevClose < lastMainEntryPrice) && priceCondition && 
-                     (!useDrawdownNow || (useDrawdownNow && drawdownPips >= MaxHedgeDrawdownPips));
+                     (!useDrawdownNow || (useDrawdownNow && drawdownPips >= requiredDrawdown));
    }
    else if(direction == -1) {
       conditionMet = (prevClose > lastMainEntryPrice) && priceCondition && 
-                     (!useDrawdownNow || (useDrawdownNow && drawdownPips >= MaxHedgeDrawdownPips));
+                     (!useDrawdownNow || (useDrawdownNow && drawdownPips >= requiredDrawdown));
    }
 
    if(conditionMet)
@@ -1136,11 +1177,13 @@ void ManageHedging()
       if(trade.PositionOpen(currentSymbol, direction == 1 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,
                          lot, currentPrice, 0, 0, "Rally_Hedge"))
       {
-         Log(StringFormat("Opened Main Hedge #%d: %s %.2f lots @ %.5f",
+         Log(StringFormat("Opened Main Hedge #%d: %s %.2f lots @ %.5f (Drawdown: %.1f/%d pips)",
                          sameDirectionCount,
                          (direction == 1) ? "BUY" : "SELL",
                          lot,
-                         currentPrice));
+                         currentPrice,
+                         drawdownPips,
+                         requiredDrawdown));
                          
          // Update counters and prices
          sameDirectionCount++;
@@ -1188,7 +1231,7 @@ void ManageHedging()
       }
       
       if(useDrawdownNow) {
-         logMsg += StringFormat(", Drawdown: %.1f/%d pips", drawdownPips, MaxHedgeDrawdownPips);
+         logMsg += StringFormat(", Drawdown: %.1f/%d pips", drawdownPips, requiredDrawdown);
       }
       Log(logMsg);
    }
