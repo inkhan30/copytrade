@@ -1,0 +1,11 @@
+Here is your Windows Remote Desktop VPS account information
+VPS Name: saeemuddin
+Remote Address: 15.235.182.168:13398
+Username: administrator
+Password: Ruman@123
+
+How to Login Remote Desktop PC:
+https://www.digitalku.com/en/kb/cara-login-ke-remote-desktop-vps-windows/ 
+
+invite your friends to register at jayahost then get a commission :
+https://www.digitalku.com/en/afiliasi/
