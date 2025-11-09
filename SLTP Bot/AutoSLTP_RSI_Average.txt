@@ -1,0 +1,1064 @@
+//+------------------------------------------------------------------+
+//| AutoSLTP_RSI_Advanced.mq5                                       |
+//| Copyright 2024, DeepSeek AI                                     |
+//| https://www.deepseek.com                                         |
+//+------------------------------------------------------------------+
+
+#property copyright "DeepSeek AI"
+#property version   "1.08"
+#property description "Automatically add SL/TP to manual trades with trailing, RSI trading, and averaging"
+
+// Input parameters
+input double   StopLossPips = 50.0;        // Stop Loss in pips
+input double   TakeProfitPips = 100.0;     // Take Profit in pips  
+input double   TrailStartPips = 30.0;      // Start trailing when profit reaches (pips)
+input double   TrailStepPips = 20.0;       // Trailing step in pips
+input bool     EnableTrailing = true;      // Enable trailing stop
+
+// RSI Trading Parameters
+input bool     EnableRSITrading = true;    // Enable RSI-based trading
+input double   LotSize = 0.1;              // Lot size for RSI trades
+input int      RSIPeriod = 14;             // RSI Period
+input ENUM_APPLIED_PRICE RSIPrice = PRICE_CLOSE; // RSI Applied Price
+input double   RSIUpperLevel = 70.0;       // RSI Upper Level (Sell)
+input double   RSILowerLevel = 40.0;       // RSI Lower Level (Buy)
+input bool     CloseOnOppositeSignal = false; // Close trades on opposite RSI signal
+input int      TimeBetweenTradesSeconds = 15; // Time gap between trades after all positions closed
+
+// Averaging Parameters
+input bool     EnableAveraging = true;     // Enable averaging for losing positions
+input int      MaxAveragingTrades = 3;     // Maximum number of averaging trades
+input double   AveragingDistancePips = 50.0; // Distance between averaging trades (pips)
+input double   CloseAllProfitPips = 100.0; // Close all positions when total profit reaches (pips)
+
+// Daily Profit/Loss Limits
+input bool     EnableDailyLimits = true;   // Enable daily profit/loss limits
+input double   DailyProfitTargetPercent = 10.0; // Daily profit target (% of capital)
+input double   DailyLossLimitPercent = 10.0;    // Daily loss limit (% of capital)
+input double   AccountCapital = 1000.0;    // Account capital for percentage calculation
+
+enum ENUM_AVERAGING_TYPE 
+{
+    AVG_INCREASING,    // Increasing lot size
+    AVG_SAME,          // Same lot size  
+    AVG_DECREASING     // Decreasing lot size
+};
+
+input ENUM_AVERAGING_TYPE AveragingType = AVG_SAME; // Averaging lot size type
+input double   LotSizeChange = 0.01;       // Lot size change for increasing/decreasing
+
+// Global variables
+int rsiHandle;
+datetime lastTradeTime;
+
+// Averaging tracking variables
+int averagingCount = 0;
+double lastAveragingPrice = 0.0;
+
+// Daily tracking variables
+double dailyProfit = 0.0;
+double dailyBalance = 0.0;
+datetime lastDayCheck = 0;
+bool tradingStopped = false;
+string stopReason = "";
+
+// Trade timing variables
+datetime lastPositionCloseTime = 0;
+bool positionsJustClosed = false;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+    Print("=== Auto SL/TP with RSI & Averaging EA Started ===");
+    Print("Stop Loss: ", StopLossPips, " pips");
+    Print("Take Profit: ", TakeProfitPips, " pips"); 
+    Print("Trail Start: ", TrailStartPips, " pips");
+    Print("RSI Trading: ", EnableRSITrading ? "Enabled" : "Disabled");
+    if(EnableRSITrading)
+    {
+        Print("RSI Levels - Buy: <= ", RSILowerLevel, ", Sell: >= ", RSIUpperLevel);
+        Print("RSI Lot Size: ", LotSize);
+        Print("Time Between Trades: ", TimeBetweenTradesSeconds, " seconds");
+    }
+    Print("Averaging: ", EnableAveraging ? "Enabled" : "Disabled");
+    if(EnableAveraging)
+    {
+        Print("Max Averaging Trades: ", MaxAveragingTrades);
+        Print("Averaging Distance: ", AveragingDistancePips, " pips");
+        Print("Averaging Type: ", EnumToString(AveragingType));
+        Print("Close All Profit: ", CloseAllProfitPips, " pips");
+    }
+    Print("Daily Limits: ", EnableDailyLimits ? "Enabled" : "Disabled");
+    if(EnableDailyLimits)
+    {
+        Print("Daily Profit Target: ", DailyProfitTargetPercent, "%");
+        Print("Daily Loss Limit: ", DailyLossLimitPercent, "%");
+        Print("Account Capital: $", AccountCapital);
+    }
+    Print("Symbol: ", _Symbol, ", Digits: ", _Digits);
+    
+    // Create RSI indicator handle only if RSI trading is enabled
+    if(EnableRSITrading)
+    {
+        rsiHandle = iRSI(_Symbol, _Period, RSIPeriod, RSIPrice);
+        if(rsiHandle == INVALID_HANDLE)
+        {
+            Print("Error creating RSI indicator");
+            return(INIT_FAILED);
+        }
+    }
+    else
+    {
+        rsiHandle = INVALID_HANDLE;
+    }
+    
+    lastTradeTime = 0;
+    averagingCount = 0;
+    lastAveragingPrice = 0.0;
+    lastPositionCloseTime = 0;
+    positionsJustClosed = false;
+    
+    // Initialize daily tracking
+    InitializeDailyTracking();
+    
+    return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+    // Release indicator handle if it was created
+    if(rsiHandle != INVALID_HANDLE)
+        IndicatorRelease(rsiHandle);
+        
+    Print("Auto SL/TP with RSI & Averaging EA removed");
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+    // Check if we need to reset daily tracking
+    CheckDailyReset();
+    
+    // Update daily profit on every tick for accurate tracking
+    UpdateDailyProfit();
+    
+    // Check if trading is stopped due to daily limits
+    if(EnableDailyLimits && tradingStopped)
+    {
+        // Display message once per minute to avoid spamming
+        static datetime lastMessageTime = 0;
+        if(TimeCurrent() - lastMessageTime >= 60)
+        {
+            Print("Trading stopped: ", stopReason, " | Daily P/L: $", DoubleToString(dailyProfit, 2));
+            lastMessageTime = TimeCurrent();
+        }
+        return;
+    }
+    
+    CheckAndModifyPositions();
+    
+    // Always check averaging regardless of RSI trading
+    if(EnableAveraging)
+    {
+        CheckAveragingOpportunities();
+        CheckTotalProfitClose();
+    }
+    
+    // Check RSI signals only if RSI trading is enabled
+    if(EnableRSITrading)
+    {
+        CheckRSISignals();
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Check if we can open new trade after positions closed            |
+//+------------------------------------------------------------------+
+bool CanOpenNewTrade()
+{
+    // If no positions were closed recently, allow trading
+    if(!positionsJustClosed) 
+        return true;
+    
+    // Check if enough time has passed since last position close
+    if(TimeCurrent() - lastPositionCloseTime >= TimeBetweenTradesSeconds)
+    {
+        positionsJustClosed = false;
+        Print("✓ Time gap passed. Ready for new trades.");
+        return true;
+    }
+    
+    // Display waiting message once every 5 seconds
+    static datetime lastWaitMessage = 0;
+    if(TimeCurrent() - lastWaitMessage >= 5)
+    {
+        int secondsLeft = (int)(TimeBetweenTradesSeconds - (TimeCurrent() - lastPositionCloseTime));
+        Print("⏳ Waiting ", secondsLeft, " seconds before opening new trade...");
+        lastWaitMessage = TimeCurrent();
+    }
+    
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Initialize daily tracking variables                              |
+//+------------------------------------------------------------------+
+void InitializeDailyTracking()
+{
+    MqlDateTime today;
+    TimeToStruct(TimeCurrent(), today);
+    today.hour = 0;
+    today.min = 0;
+    today.sec = 0;
+    lastDayCheck = StructToTime(today);
+    
+    dailyBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+    dailyProfit = 0.0;
+    tradingStopped = false;
+    stopReason = "";
+    
+    Print("Daily tracking initialized. Starting balance: $", DoubleToString(dailyBalance, 2));
+    if(EnableDailyLimits)
+    {
+        Print("Daily profit target: $", DoubleToString(dailyBalance * DailyProfitTargetPercent / 100.0, 2));
+        Print("Daily loss limit: $", DoubleToString(dailyBalance * DailyLossLimitPercent / 100.0, 2));
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Check if we need to reset daily tracking at new day              |
+//+------------------------------------------------------------------+
+void CheckDailyReset()
+{
+    MqlDateTime currentTime;
+    TimeToStruct(TimeCurrent(), currentTime);
+    
+    MqlDateTime lastCheckTime;
+    TimeToStruct(lastDayCheck, lastCheckTime);
+    
+    // Check if day has changed
+    if(currentTime.day != lastCheckTime.day || 
+       currentTime.mon != lastCheckTime.mon || 
+       currentTime.year != lastCheckTime.year)
+    {
+        Print("=== New trading day started ===");
+        Print("Previous day profit/loss: $", DoubleToString(dailyProfit, 2));
+        
+        // Reset daily tracking
+        dailyBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+        dailyProfit = 0.0;
+        tradingStopped = false;
+        stopReason = "";
+        positionsJustClosed = false;
+        
+        MqlDateTime today;
+        TimeToStruct(TimeCurrent(), today);
+        today.hour = 0;
+        today.min = 0;
+        today.sec = 0;
+        lastDayCheck = StructToTime(today);
+        
+        Print("New day starting balance: $", DoubleToString(dailyBalance, 2));
+        if(EnableDailyLimits)
+        {
+            Print("Daily profit target: $", DoubleToString(dailyBalance * DailyProfitTargetPercent / 100.0, 2));
+            Print("Daily loss limit: $", DoubleToString(dailyBalance * DailyLossLimitPercent / 100.0, 2));
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Update daily profit and check limits                             |
+//+------------------------------------------------------------------+
+void UpdateDailyProfit()
+{
+    if(!EnableDailyLimits) return;
+    
+    double currentBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+    double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+    
+    // Use the worst of balance or equity to be conservative
+    double currentValue = MathMin(currentBalance, currentEquity);
+    dailyProfit = currentValue - dailyBalance;
+    
+    double profitTarget = dailyBalance * DailyProfitTargetPercent / 100.0;
+    double lossLimit = dailyBalance * DailyLossLimitPercent / 100.0;
+    
+    // Check profit target
+    if(dailyProfit >= profitTarget && !tradingStopped)
+    {
+        tradingStopped = true;
+        stopReason = "Daily profit target achieved: $" + DoubleToString(dailyProfit, 2) + 
+                    " (" + DoubleToString((dailyProfit/dailyBalance)*100, 1) + "%)";
+        Print("=== TRADING STOPPED ===");
+        Print("✓ Daily profit target reached!");
+        Print("Profit: $", DoubleToString(dailyProfit, 2));
+        Print("Target: $", DoubleToString(profitTarget, 2));
+        Print("Percentage: ", DoubleToString((dailyProfit / dailyBalance) * 100, 1), "%");
+        
+        // Close all open positions
+        CloseAllPositions();
+    }
+    
+    // Check loss limit
+    if(dailyProfit <= -lossLimit && !tradingStopped)
+    {
+        tradingStopped = true;
+        stopReason = "Daily loss limit reached: $" + DoubleToString(dailyProfit, 2) + 
+                    " (" + DoubleToString(MathAbs(dailyProfit/dailyBalance)*100, 1) + "%)";
+        Print("=== TRADING STOPPED ===");
+        Print("✗ Daily loss limit reached!");
+        Print("Loss: $", DoubleToString(dailyProfit, 2));
+        Print("Limit: $", DoubleToString(lossLimit, 2));
+        Print("Percentage: ", DoubleToString(MathAbs(dailyProfit / dailyBalance) * 100, 1), "%");
+        
+        // Close all open positions
+        CloseAllPositions();
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Check if total profit reached target and close all positions     |
+//+------------------------------------------------------------------+
+void CheckTotalProfitClose()
+{
+    int total = PositionsTotal();
+    if(total == 0) 
+        return;
+    
+    double totalProfitPips = CalculateTotalProfitPips();
+    
+    if(totalProfitPips >= CloseAllProfitPips)
+    {
+        Print("✓ Total profit reached target: ", DoubleToString(totalProfitPips, 2), " pips");
+        Print("  Closing all positions...");
+        CloseAllPositions();
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate total profit in pips for all positions                 |
+//+------------------------------------------------------------------+
+double CalculateTotalProfitPips()
+{
+    int total = PositionsTotal();
+    double totalProfit = 0.0;
+    double pipSize = GetPipSize();
+    
+    for(int i = 0; i < total; i++)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(ticket > 0 && PositionSelectByTicket(ticket))
+        {
+            if(PositionGetString(POSITION_SYMBOL) == _Symbol)
+            {
+                ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+                double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+                double currentPrice = 0;
+                double volume = PositionGetDouble(POSITION_VOLUME);
+                
+                // Get current price based on position type
+                if(posType == POSITION_TYPE_BUY)
+                    currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+                else
+                    currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+                
+                // Calculate profit in pips
+                double profitPips = 0;
+                if(posType == POSITION_TYPE_BUY)
+                    profitPips = (currentPrice - openPrice) / pipSize;
+                else
+                    profitPips = (openPrice - currentPrice) / pipSize;
+                
+                // Weight by volume (lot size)
+                totalProfit += profitPips * volume;
+            }
+        }
+    }
+    
+    return totalProfit;
+}
+
+//+------------------------------------------------------------------+
+//| Close all positions regardless of type                           |
+//+------------------------------------------------------------------+
+void CloseAllPositions()
+{
+    int total = PositionsTotal();
+    int closedCount = 0;
+    
+    for(int i = total - 1; i >= 0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(ticket > 0 && PositionSelectByTicket(ticket))
+        {
+            if(PositionGetString(POSITION_SYMBOL) == _Symbol)
+            {
+                ClosePosition(ticket);
+                closedCount++;
+            }
+        }
+    }
+    
+    // Set timing variables to prevent immediate new trades
+    if(closedCount > 0)
+    {
+        lastPositionCloseTime = TimeCurrent();
+        positionsJustClosed = true;
+        Print("⏳ Trade cooldown activated. Waiting ", TimeBetweenTradesSeconds, " seconds before new trades.");
+    }
+    
+    // Reset averaging count when all positions are closed
+    averagingCount = 0;
+    lastAveragingPrice = 0.0;
+    
+    Print("✓ All positions closed (", closedCount, " positions). Averaging count reset.");
+}
+
+//+------------------------------------------------------------------+
+//| Check RSI signals for trading                                    |
+//+------------------------------------------------------------------+
+void CheckRSISignals()
+{
+    // Check if trading is stopped
+    if(tradingStopped) return;
+    
+    // Check if we should wait before opening new trades
+    if(!CanOpenNewTrade()) return;
+    
+    // Get current RSI value
+    double rsiValue = GetCurrentRSI();
+    if(rsiValue == EMPTY_VALUE)
+        return;
+    
+    // Check if we have any open positions
+    bool hasBuyPosition = HasOpenPosition(POSITION_TYPE_BUY);
+    bool hasSellPosition = HasOpenPosition(POSITION_TYPE_SELL);
+    
+    // RSI Buy signal (oversold)
+    if(rsiValue <= RSILowerLevel)
+    {
+        if(!hasBuyPosition)
+        {
+            // Close sell positions if enabled
+            if(CloseOnOppositeSignal && hasSellPosition)
+            {
+                CloseAllPositions(POSITION_TYPE_SELL);
+            }
+            
+            // Open buy order and reset averaging count
+            OpenBuyOrder();
+            averagingCount = 0;
+            lastAveragingPrice = 0.0;
+        }
+    }
+    // RSI Sell signal (overbought)
+    else if(rsiValue >= RSIUpperLevel)
+    {
+        if(!hasSellPosition)
+        {
+            // Close buy positions if enabled
+            if(CloseOnOppositeSignal && hasBuyPosition)
+            {
+                CloseAllPositions(POSITION_TYPE_BUY);
+            }
+            
+            // Open sell order and reset averaging count
+            OpenSellOrder();
+            averagingCount = 0;
+            lastAveragingPrice = 0.0;
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Check for averaging opportunities                                |
+//+------------------------------------------------------------------+
+void CheckAveragingOpportunities()
+{
+    // Check if trading is stopped
+    if(tradingStopped) return;
+    
+    int total = PositionsTotal();
+    if(total == 0) 
+    {
+        averagingCount = 0;
+        lastAveragingPrice = 0.0;
+        return;
+    }
+    
+    // Check each position for averaging opportunity
+    for(int i = 0; i < total; i++)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(ticket > 0 && PositionSelectByTicket(ticket))
+        {
+            if(PositionGetString(POSITION_SYMBOL) == _Symbol)
+            {
+                CheckPositionForAveraging(ticket);
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Check individual position for averaging opportunity              |
+//+------------------------------------------------------------------+
+void CheckPositionForAveraging(ulong ticket)
+{
+    ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+    double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+    double currentPrice = 0;
+    double currentProfit = PositionGetDouble(POSITION_PROFIT);
+    
+    // Get current price based on position type
+    if(posType == POSITION_TYPE_BUY)
+        currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    else
+        currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    
+    // Calculate distance from open price in pips
+    double pipSize = GetPipSize();
+    double distancePips = 0;
+    
+    if(posType == POSITION_TYPE_BUY)
+        distancePips = (openPrice - currentPrice) / pipSize; // Negative for buy positions
+    else
+        distancePips = (currentPrice - openPrice) / pipSize; // Negative for sell positions
+    
+    // For averaging, we want the price to move against us by the specified distance
+    if(distancePips >= AveragingDistancePips && averagingCount < MaxAveragingTrades)
+    {
+        // Check if we need to open a new averaging trade
+        // We open averaging trades at fixed intervals from the original price
+        double nextAveragingLevel = 0;
+        
+        if(posType == POSITION_TYPE_BUY)
+            nextAveragingLevel = openPrice - ((averagingCount + 1) * AveragingDistancePips * pipSize);
+        else
+            nextAveragingLevel = openPrice + ((averagingCount + 1) * AveragingDistancePips * pipSize);
+        
+        // Check if price has reached the next averaging level
+        bool shouldAverage = false;
+        
+        if(posType == POSITION_TYPE_BUY)
+            shouldAverage = (currentPrice <= nextAveragingLevel) && (lastAveragingPrice == 0.0 || currentPrice < lastAveragingPrice);
+        else
+            shouldAverage = (currentPrice >= nextAveragingLevel) && (lastAveragingPrice == 0.0 || currentPrice > lastAveragingPrice);
+        
+        if(shouldAverage && currentProfit < 0)
+        {
+            // Open averaging trade
+            if(posType == POSITION_TYPE_BUY)
+                OpenAveragingBuyOrder(currentPrice);
+            else
+                OpenAveragingSellOrder(currentPrice);
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Open averaging buy order                                         |
+//+------------------------------------------------------------------+
+void OpenAveragingBuyOrder(double currentPrice)
+{
+    double newLotSize = CalculateAveragingLotSize();
+    
+    MqlTradeRequest request;
+    MqlTradeResult result;
+    ZeroMemory(request);
+    ZeroMemory(result);
+    
+    double price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double sl = price - (StopLossPips * GetPipSize());
+    double tp = price + (TakeProfitPips * GetPipSize());
+    
+    request.action = TRADE_ACTION_DEAL;
+    request.symbol = _Symbol;
+    request.volume = newLotSize;
+    request.type = ORDER_TYPE_BUY;
+    request.price = price;
+    request.sl = NormalizeDouble(sl, _Digits);
+    request.tp = NormalizeDouble(tp, _Digits);
+    request.deviation = 10;
+    request.type_filling = ORDER_FILLING_FOK;
+    request.comment = "Averaging " + IntegerToString(averagingCount + 1);
+    
+    bool success = OrderSend(request, result);
+    
+    if(success && result.retcode == TRADE_RETCODE_DONE)
+    {
+        averagingCount++;
+        lastAveragingPrice = currentPrice;
+        Print("✓ Averaging Buy order #", averagingCount, " opened at ", DoubleToString(price, _Digits));
+        Print("  Lot Size: ", newLotSize, " SL: ", DoubleToString(request.sl, _Digits), " TP: ", DoubleToString(request.tp, _Digits));
+        Print("  Averaging level: ", DoubleToString(currentPrice, _Digits), " (", DoubleToString(averagingCount * AveragingDistancePips, 1), " pips from original)");
+    }
+    else
+    {
+        Print("✗ Failed to open averaging buy order. Error: ", result.retcode);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Open averaging sell order                                        |
+//+------------------------------------------------------------------+
+void OpenAveragingSellOrder(double currentPrice)
+{
+    double newLotSize = CalculateAveragingLotSize();
+    
+    MqlTradeRequest request;
+    MqlTradeResult result;
+    ZeroMemory(request);
+    ZeroMemory(result);
+    
+    double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double sl = price + (StopLossPips * GetPipSize());
+    double tp = price - (TakeProfitPips * GetPipSize());
+    
+    request.action = TRADE_ACTION_DEAL;
+    request.symbol = _Symbol;
+    request.volume = newLotSize;
+    request.type = ORDER_TYPE_SELL;
+    request.price = price;
+    request.sl = NormalizeDouble(sl, _Digits);
+    request.tp = NormalizeDouble(tp, _Digits);
+    request.deviation = 10;
+    request.type_filling = ORDER_FILLING_FOK;
+    request.comment = "Averaging " + IntegerToString(averagingCount + 1);
+    
+    bool success = OrderSend(request, result);
+    
+    if(success && result.retcode == TRADE_RETCODE_DONE)
+    {
+        averagingCount++;
+        lastAveragingPrice = currentPrice;
+        Print("✓ Averaging Sell order #", averagingCount, " opened at ", DoubleToString(price, _Digits));
+        Print("  Lot Size: ", newLotSize, " SL: ", DoubleToString(request.sl, _Digits), " TP: ", DoubleToString(request.tp, _Digits));
+        Print("  Averaging level: ", DoubleToString(currentPrice, _Digits), " (", DoubleToString(averagingCount * AveragingDistancePips, 1), " pips from original)");
+    }
+    else
+    {
+        Print("✗ Failed to open averaging sell order. Error: ", result.retcode);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate lot size for averaging trade                           |
+//+------------------------------------------------------------------+
+double CalculateAveragingLotSize()
+{
+    double baseLot = LotSize;
+    
+    switch(AveragingType)
+    {
+        case AVG_INCREASING:
+            return baseLot + (averagingCount * LotSizeChange);
+            
+        case AVG_SAME:
+            return baseLot;
+            
+        case AVG_DECREASING:
+            return MathMax(0.01, baseLot - (averagingCount * LotSizeChange));
+    }
+    
+    return baseLot;
+}
+
+//+------------------------------------------------------------------+
+//| Get current RSI value                                            |
+//+------------------------------------------------------------------+
+double GetCurrentRSI()
+{
+    // If RSI trading is disabled, return EMPTY_VALUE
+    if(!EnableRSITrading || rsiHandle == INVALID_HANDLE)
+        return EMPTY_VALUE;
+        
+    double rsiArray[];
+    ArraySetAsSeries(rsiArray, true);
+    
+    if(CopyBuffer(rsiHandle, 0, 0, 1, rsiArray) < 1)
+    {
+        Print("Error copying RSI buffer");
+        return EMPTY_VALUE;
+    }
+    
+    return rsiArray[0];
+}
+
+//+------------------------------------------------------------------+
+//| Check if there's an open position of specified type              |
+//+------------------------------------------------------------------+
+bool HasOpenPosition(ENUM_POSITION_TYPE type)
+{
+    int total = PositionsTotal();
+    
+    for(int i = 0; i < total; i++)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(ticket > 0 && PositionSelectByTicket(ticket))
+        {
+            if(PositionGetString(POSITION_SYMBOL) == _Symbol && 
+               PositionGetInteger(POSITION_TYPE) == type)
+            {
+                return true;
+            }
+        }
+    }
+    
+    return false;
+}
+
+//+------------------------------------------------------------------+
+//| Close all positions of specified type                            |
+//+------------------------------------------------------------------+
+void CloseAllPositions(ENUM_POSITION_TYPE type)
+{
+    int total = PositionsTotal();
+    int closedCount = 0;
+    
+    for(int i = total - 1; i >= 0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(ticket > 0 && PositionSelectByTicket(ticket))
+        {
+            if(PositionGetString(POSITION_SYMBOL) == _Symbol && 
+               PositionGetInteger(POSITION_TYPE) == type)
+            {
+                ClosePosition(ticket);
+                closedCount++;
+            }
+        }
+    }
+    
+    // Set timing variables to prevent immediate new trades
+    if(closedCount > 0)
+    {
+        lastPositionCloseTime = TimeCurrent();
+        positionsJustClosed = true;
+        Print("⏳ Trade cooldown activated. Waiting ", TimeBetweenTradesSeconds, " seconds before new trades.");
+    }
+    
+    // Reset averaging count when positions are closed
+    averagingCount = 0;
+    lastAveragingPrice = 0.0;
+    
+    Print("✓ All ", (type == POSITION_TYPE_BUY ? "BUY" : "SELL"), " positions closed (", closedCount, " positions). Averaging count reset.");
+}
+
+//+------------------------------------------------------------------+
+//| Close individual position                                        |
+//+------------------------------------------------------------------+
+void ClosePosition(ulong ticket)
+{
+    MqlTradeRequest request;
+    MqlTradeResult result;
+    ZeroMemory(request);
+    ZeroMemory(result);
+    
+    request.action = TRADE_ACTION_DEAL;
+    request.position = ticket;
+    request.symbol = _Symbol;
+    request.volume = PositionGetDouble(POSITION_VOLUME);
+    request.deviation = 10;
+    
+    if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+    {
+        request.price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+        request.type = ORDER_TYPE_SELL;
+    }
+    else
+    {
+        request.price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+        request.type = ORDER_TYPE_BUY;
+    }
+    
+    request.type_filling = ORDER_FILLING_FOK;
+    
+    bool success = OrderSend(request, result);
+    
+    if(success && result.retcode == TRADE_RETCODE_DONE)
+    {
+        Print("✓ Position closed #", ticket);
+    }
+    else
+    {
+        Print("✗ Failed to close position #", ticket, " Error: ", result.retcode);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Open buy order                                                   |
+//+------------------------------------------------------------------+
+void OpenBuyOrder()
+{
+    MqlTradeRequest request;
+    MqlTradeResult result;
+    ZeroMemory(request);
+    ZeroMemory(result);
+    
+    double price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    double sl = price - (StopLossPips * GetPipSize());
+    double tp = price + (TakeProfitPips * GetPipSize());
+    
+    request.action = TRADE_ACTION_DEAL;
+    request.symbol = _Symbol;
+    request.volume = LotSize;
+    request.type = ORDER_TYPE_BUY;
+    request.price = price;
+    request.sl = NormalizeDouble(sl, _Digits);
+    request.tp = NormalizeDouble(tp, _Digits);
+    request.deviation = 10;
+    request.type_filling = ORDER_FILLING_FOK;
+    
+    bool success = OrderSend(request, result);
+    
+    if(success && result.retcode == TRADE_RETCODE_DONE)
+    {
+        Print("✓ Buy order opened at ", DoubleToString(price, _Digits));
+        Print("  SL: ", DoubleToString(request.sl, _Digits), " TP: ", DoubleToString(request.tp, _Digits));
+        lastTradeTime = TimeCurrent();
+    }
+    else
+    {
+        Print("✗ Failed to open buy order. Error: ", result.retcode);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Open sell order                                                  |
+//+------------------------------------------------------------------+
+void OpenSellOrder()
+{
+    MqlTradeRequest request;
+    MqlTradeResult result;
+    ZeroMemory(request);
+    ZeroMemory(result);
+    
+    double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    double sl = price + (StopLossPips * GetPipSize());
+    double tp = price - (TakeProfitPips * GetPipSize());
+    
+    request.action = TRADE_ACTION_DEAL;
+    request.symbol = _Symbol;
+    request.volume = LotSize;
+    request.type = ORDER_TYPE_SELL;
+    request.price = price;
+    request.sl = NormalizeDouble(sl, _Digits);
+    request.tp = NormalizeDouble(tp, _Digits);
+    request.deviation = 10;
+    request.type_filling = ORDER_FILLING_FOK;
+    
+    bool success = OrderSend(request, result);
+    
+    if(success && result.retcode == TRADE_RETCODE_DONE)
+    {
+        Print("✓ Sell order opened at ", DoubleToString(price, _Digits));
+        Print("  SL: ", DoubleToString(request.sl, _Digits), " TP: ", DoubleToString(request.tp, _Digits));
+        lastTradeTime = TimeCurrent();
+    }
+    else
+    {
+        Print("✗ Failed to open sell order. Error: ", result.retcode);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Check and modify all positions                                   |
+//+------------------------------------------------------------------+
+void CheckAndModifyPositions()
+{
+    int total = PositionsTotal();
+    
+    for(int i = total - 1; i >= 0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(ticket > 0)
+        {
+            if(PositionSelectByTicket(ticket))
+            {
+                string symbol = PositionGetString(POSITION_SYMBOL);
+                if(symbol == _Symbol)
+                {
+                    ManagePosition(ticket);
+                }
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Manage individual position                                       |
+//+------------------------------------------------------------------+
+void ManagePosition(ulong ticket)
+{
+    // Get position details
+    double currentSL = PositionGetDouble(POSITION_SL);
+    double currentTP = PositionGetDouble(POSITION_TP);
+    ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+    double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+    
+    // Calculate pip size
+    double pipSize = GetPipSize();
+    
+    // If no SL/TP set, add them
+    if(currentSL == 0 && currentTP == 0)
+    {
+        AddSLTP(ticket, posType, openPrice, pipSize);
+    }
+    // If trailing enabled and SL exists, trail it
+    else if(EnableTrailing && currentSL != 0)
+    {
+        TrailSL(ticket, posType, openPrice, currentSL, pipSize);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Get pip size based on symbol digits                              |
+//+------------------------------------------------------------------+
+double GetPipSize()
+{
+    if(_Digits == 3 || _Digits == 5)
+        return _Point * 10;
+    else
+        return _Point;
+}
+
+//+------------------------------------------------------------------+
+//| Add SL and TP to position                                        |
+//+------------------------------------------------------------------+
+void AddSLTP(ulong ticket, ENUM_POSITION_TYPE type, double openPrice, double pipSize)
+{
+    double newSL = 0;
+    double newTP = 0;
+    double slDistance = StopLossPips * pipSize;
+    double tpDistance = TakeProfitPips * pipSize;
+    
+    if(type == POSITION_TYPE_BUY)
+    {
+        newSL = openPrice - slDistance;
+        newTP = openPrice + tpDistance;
+    }
+    else if(type == POSITION_TYPE_SELL)
+    {
+        newSL = openPrice + slDistance;
+        newTP = openPrice - tpDistance;
+    }
+    
+    // Normalize prices
+    newSL = NormalizeDouble(newSL, _Digits);
+    newTP = NormalizeDouble(newTP, _Digits);
+    
+    // Create trade object and modify position
+    MqlTradeRequest request;
+    MqlTradeResult result;
+    ZeroMemory(request);
+    ZeroMemory(result);
+    
+    request.action = TRADE_ACTION_SLTP;
+    request.position = ticket;
+    request.sl = newSL;
+    request.tp = newTP;
+    request.symbol = _Symbol;
+    request.magic = 0;
+    
+    bool success = OrderSend(request, result);
+    
+    if(success && result.retcode == TRADE_RETCODE_DONE)
+    {
+        Print("✓ SL/TP added to position #", ticket);
+        Print("  SL: ", DoubleToString(newSL, _Digits), " TP: ", DoubleToString(newTP, _Digits));
+    }
+    else
+    {
+        Print("✗ Failed to add SL/TP to #", ticket, " Error: ", result.retcode);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Trail stop loss                                                  |
+//+------------------------------------------------------------------+
+void TrailSL(ulong ticket, ENUM_POSITION_TYPE type, double openPrice, double currentSL, double pipSize)
+{
+    double currentPrice = 0;
+    double newSL = currentSL;
+    double trailStart = TrailStartPips * pipSize;
+    double trailStep = TrailStepPips * pipSize;
+    bool shouldModify = false;
+    
+    if(type == POSITION_TYPE_BUY)
+    {
+        currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+        double profit = currentPrice - openPrice;
+        
+        if(profit >= trailStart)
+        {
+            double proposedSL = currentPrice - trailStart;
+            proposedSL = NormalizeDouble(proposedSL, _Digits);
+            
+            // Only move SL forward and ensure we don't go below breakeven
+            if(proposedSL > currentSL && proposedSL > openPrice)
+            {
+                if(currentPrice - currentSL >= trailStep)
+                {
+                    newSL = proposedSL;
+                    shouldModify = true;
+                }
+            }
+        }
+    }
+    else if(type == POSITION_TYPE_SELL)
+    {
+        currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+        double profit = openPrice - currentPrice;
+        
+        if(profit >= trailStart)
+        {
+            double proposedSL = currentPrice + trailStart;
+            proposedSL = NormalizeDouble(proposedSL, _Digits);
+            
+            // Only move SL forward and ensure we don't go above breakeven
+            if(proposedSL < currentSL && proposedSL < openPrice)
+            {
+                if(currentSL - currentPrice >= trailStep)
+                {
+                    newSL = proposedSL;
+                    shouldModify = true;
+                }
+            }
+        }
+    }
+    
+    if(shouldModify)
+    {
+        MqlTradeRequest request;
+        MqlTradeResult result;
+        ZeroMemory(request);
+        ZeroMemory(result);
+        
+        request.action = TRADE_ACTION_SLTP;
+        request.position = ticket;
+        request.sl = newSL;
+        request.tp = PositionGetDouble(POSITION_TP); // Keep existing TP
+        request.symbol = _Symbol;
+        request.magic = 0;
+        
+        bool success = OrderSend(request, result);
+        
+        if(success && result.retcode == TRADE_RETCODE_DONE)
+        {
+            Print("✓ SL trailed for position #", ticket, " New SL: ", DoubleToString(newSL, _Digits));
+        }
+        else
+        {
+            Print("✗ Failed to trail SL for #", ticket, " Error: ", result.retcode);
+        }
+    }
+}

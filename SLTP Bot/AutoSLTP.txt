@@ -1,0 +1,239 @@
+//+------------------------------------------------------------------+
+//| AutoSLTP.mq5                                                     |
+//| Copyright 2024, DeepSeek AI                                     |
+//| https://www.deepseek.com                                         |
+//+------------------------------------------------------------------+
+
+#property copyright "DeepSeek AI"
+#property version   "1.00"
+#property description "Automatically add SL/TP to manual trades with trailing"
+
+// Input parameters
+input double   StopLossPips = 50.0;        // Stop Loss in pips
+input double   TakeProfitPips = 100.0;     // Take Profit in pips  
+input double   TrailStartPips = 30.0;      // Start trailing when profit reaches (pips)
+input double   TrailStepPips = 20.0;       // Trailing step in pips
+input bool     EnableTrailing = true;      // Enable trailing stop
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+    Print("=== Auto SL/TP EA Started ===");
+    Print("Stop Loss: ", StopLossPips, " pips");
+    Print("Take Profit: ", TakeProfitPips, " pips"); 
+    Print("Trail Start: ", TrailStartPips, " pips");
+    Print("Symbol: ", _Symbol, ", Digits: ", _Digits);
+    
+    return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+    Print("Auto SL/TP EA removed");
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+    CheckAndModifyPositions();
+}
+
+//+------------------------------------------------------------------+
+//| Check and modify all positions                                   |
+//+------------------------------------------------------------------+
+void CheckAndModifyPositions()
+{
+    int total = PositionsTotal();
+    
+    for(int i = total - 1; i >= 0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(ticket > 0)
+        {
+            if(PositionSelectByTicket(ticket))
+            {
+                string symbol = PositionGetString(POSITION_SYMBOL);
+                if(symbol == _Symbol)
+                {
+                    ManagePosition(ticket);
+                }
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Manage individual position                                       |
+//+------------------------------------------------------------------+
+void ManagePosition(ulong ticket)
+{
+    // Get position details
+    double currentSL = PositionGetDouble(POSITION_SL);
+    double currentTP = PositionGetDouble(POSITION_TP);
+    ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+    double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+    
+    // Calculate pip size
+    double pipSize = GetPipSize();
+    
+    // If no SL/TP set, add them
+    if(currentSL == 0 && currentTP == 0)
+    {
+        AddSLTP(ticket, posType, openPrice, pipSize);
+    }
+    // If trailing enabled and SL exists, trail it
+    else if(EnableTrailing && currentSL != 0)
+    {
+        TrailSL(ticket, posType, openPrice, currentSL, pipSize);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Get pip size based on symbol digits                              |
+//+------------------------------------------------------------------+
+double GetPipSize()
+{
+    if(_Digits == 3 || _Digits == 5)
+        return _Point * 10;
+    else
+        return _Point;
+}
+
+//+------------------------------------------------------------------+
+//| Add SL and TP to position                                        |
+//+------------------------------------------------------------------+
+void AddSLTP(ulong ticket, ENUM_POSITION_TYPE type, double openPrice, double pipSize)
+{
+    double newSL = 0;
+    double newTP = 0;
+    double slDistance = StopLossPips * pipSize;
+    double tpDistance = TakeProfitPips * pipSize;
+    
+    if(type == POSITION_TYPE_BUY)
+    {
+        newSL = openPrice - slDistance;
+        newTP = openPrice + tpDistance;
+    }
+    else if(type == POSITION_TYPE_SELL)
+    {
+        newSL = openPrice + slDistance;
+        newTP = openPrice - tpDistance;
+    }
+    
+    // Normalize prices
+    newSL = NormalizeDouble(newSL, _Digits);
+    newTP = NormalizeDouble(newTP, _Digits);
+    
+    // Create trade object and modify position
+    MqlTradeRequest request;
+    MqlTradeResult result;
+    ZeroMemory(request);
+    ZeroMemory(result);
+    
+    request.action = TRADE_ACTION_SLTP;
+    request.position = ticket;
+    request.sl = newSL;
+    request.tp = newTP;
+    request.symbol = _Symbol;
+    request.magic = 0;
+    
+    bool success = OrderSend(request, result);
+    
+    if(success && result.retcode == TRADE_RETCODE_DONE)
+    {
+        Print("✓ SL/TP added to position #", ticket);
+        Print("  SL: ", DoubleToString(newSL, _Digits), " TP: ", DoubleToString(newTP, _Digits));
+    }
+    else
+    {
+        Print("✗ Failed to add SL/TP to #", ticket, " Error: ", result.retcode);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Trail stop loss                                                  |
+//+------------------------------------------------------------------+
+void TrailSL(ulong ticket, ENUM_POSITION_TYPE type, double openPrice, double currentSL, double pipSize)
+{
+    double currentPrice = 0;
+    double newSL = currentSL;
+    double trailStart = TrailStartPips * pipSize;
+    double trailStep = TrailStepPips * pipSize;
+    bool shouldModify = false;
+    
+    if(type == POSITION_TYPE_BUY)
+    {
+        currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+        double profit = currentPrice - openPrice;
+        
+        if(profit >= trailStart)
+        {
+            double proposedSL = currentPrice - trailStart;
+            proposedSL = NormalizeDouble(proposedSL, _Digits);
+            
+            // Only move SL forward and ensure we don't go below breakeven
+            if(proposedSL > currentSL && proposedSL > openPrice)
+            {
+                if(currentPrice - currentSL >= trailStep)
+                {
+                    newSL = proposedSL;
+                    shouldModify = true;
+                }
+            }
+        }
+    }
+    else if(type == POSITION_TYPE_SELL)
+    {
+        currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+        double profit = openPrice - currentPrice;
+        
+        if(profit >= trailStart)
+        {
+            double proposedSL = currentPrice + trailStart;
+            proposedSL = NormalizeDouble(proposedSL, _Digits);
+            
+            // Only move SL forward and ensure we don't go above breakeven
+            if(proposedSL < currentSL && proposedSL < openPrice)
+            {
+                if(currentSL - currentPrice >= trailStep)
+                {
+                    newSL = proposedSL;
+                    shouldModify = true;
+                }
+            }
+        }
+    }
+    
+    if(shouldModify)
+    {
+        MqlTradeRequest request;
+        MqlTradeResult result;
+        ZeroMemory(request);
+        ZeroMemory(result);
+        
+        request.action = TRADE_ACTION_SLTP;
+        request.position = ticket;
+        request.sl = newSL;
+        request.tp = PositionGetDouble(POSITION_TP); // Keep existing TP
+        request.symbol = _Symbol;
+        request.magic = 0;
+        
+        bool success = OrderSend(request, result);
+        
+        if(success && result.retcode == TRADE_RETCODE_DONE)
+        {
+            Print("✓ SL trailed for position #", ticket, " New SL: ", DoubleToString(newSL, _Digits));
+        }
+        else
+        {
+            Print("✗ Failed to trail SL for #", ticket, " Error: ", result.retcode);
+        }
+    }
+}
