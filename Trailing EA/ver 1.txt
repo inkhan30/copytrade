@@ -1,0 +1,348 @@
+//+------------------------------------------------------------------+
+//|                                                  TrailingEA.mq5  |
+//|                                                                  |
+//|                                                                  |
+//+------------------------------------------------------------------+
+#property copyright "Trailing EA"
+#property version   "1.00"
+#property description "EA for manual trading with trailing SL/TP"
+
+//--- Include Trade library
+#include <Trade/Trade.mqh>
+
+//--- Input parameters
+input double   LotSize      = 0.1;       // Lot size
+input int      StopLoss     = 200;       // Stop Loss (points)
+input int      TakeProfit   = 400;       // Take Profit (points)
+input int      TrailingStop = 100;       // Trailing Stop (points)
+input int      TrailingStep = 50;        // Trailing step (points)
+input int      MagicNumber  = 12345;     // Magic number
+input int      Slippage     = 10;        // Slippage (points)
+input string   TradeComment = "TrailingEA"; // Trade comment
+input bool     ManageExistingTrades = true; // Manage existing trades
+
+//--- Global variables
+CTrade trade;
+double point;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   //--- Initialize trade object
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(Slippage);
+   trade.SetAsyncMode(false);
+   
+   //--- Get point size
+   point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   
+   Print("Trailing EA initialized successfully");
+   Print("Will manage SL/TP for all trades on this chart");
+   
+   //--- Check for existing positions and set SL/TP if needed
+   if(ManageExistingTrades)
+   {
+      CheckExistingPositions();
+   }
+   
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   Print("Trailing EA deinitialized");
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   //--- Manage trailing stops for all positions
+   ManageTrailingStops();
+}
+
+//+------------------------------------------------------------------+
+//| Check existing positions and set SL/TP if missing               |
+//+------------------------------------------------------------------+
+void CheckExistingPositions()
+{
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0 && PositionSelectByTicket(ticket))
+      {
+         string symbol = PositionGetString(POSITION_SYMBOL);
+         if(symbol == _Symbol)
+         {
+            double currentSL = PositionGetDouble(POSITION_SL);
+            double currentTP = PositionGetDouble(POSITION_TP);
+            
+            // If SL or TP is not set, set them
+            if(currentSL == 0 || currentTP == 0)
+            {
+               SetSLTPForPosition(ticket);
+            }
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Set SL and TP for a position                                     |
+//+------------------------------------------------------------------+
+void SetSLTPForPosition(ulong ticket)
+{
+   if(PositionSelectByTicket(ticket))
+   {
+      long type = PositionGetInteger(POSITION_TYPE);
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double newSL = 0, newTP = 0;
+      
+      if(type == POSITION_TYPE_BUY)
+      {
+         newSL = openPrice - (StopLoss * point);
+         newTP = openPrice + (TakeProfit * point);
+      }
+      else if(type == POSITION_TYPE_SELL)
+      {
+         newSL = openPrice + (StopLoss * point);
+         newTP = openPrice - (TakeProfit * point);
+      }
+      
+      // Modify the position with new SL and TP
+      if(trade.PositionModify(ticket, newSL, newTP))
+      {
+         Print("SL/TP set for existing position. Ticket: ", ticket, " SL: ", newSL, " TP: ", newTP);
+      }
+      else
+      {
+         Print("Error setting SL/TP for ticket ", ticket, ": ", trade.ResultRetcodeDescription());
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Open buy order                                                   |
+//+------------------------------------------------------------------+
+void OpenBuyOrder()
+{
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double sl = ask - (StopLoss * point);
+   double tp = ask + (TakeProfit * point);
+   
+   if(trade.Buy(LotSize, _Symbol, ask, sl, tp, TradeComment))
+   {
+      Print("Buy order opened. Price: ", ask, " SL: ", sl, " TP: ", tp);
+   }
+   else
+   {
+      Print("Error opening buy order: ", trade.ResultRetcodeDescription());
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Open sell order                                                  |
+//+------------------------------------------------------------------+
+void OpenSellOrder()
+{
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double sl = bid + (StopLoss * point);
+   double tp = bid - (TakeProfit * point);
+   
+   if(trade.Sell(LotSize, _Symbol, bid, sl, tp, TradeComment))
+   {
+      Print("Sell order opened. Price: ", bid, " SL: ", sl, " TP: ", tp);
+   }
+   else
+   {
+      Print("Error opening sell order: ", trade.ResultRetcodeDescription());
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Close all positions                                              |
+//+------------------------------------------------------------------+
+void CloseAllPositions()
+{
+   for(int i = PositionsTotal()-1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0)
+      {
+         if(PositionSelectByTicket(ticket))
+         {
+            string symbol = PositionGetString(POSITION_SYMBOL);
+            if(symbol == _Symbol)
+            {
+               if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+               {
+                  trade.Sell(PositionGetDouble(POSITION_VOLUME), _Symbol);
+               }
+               else
+               {
+                  trade.Buy(PositionGetDouble(POSITION_VOLUME), _Symbol);
+               }
+            }
+         }
+      }
+   }
+   Print("All positions closed");
+}
+
+//+------------------------------------------------------------------+
+//| Manage trailing stops                                            |
+//+------------------------------------------------------------------+
+void ManageTrailingStops()
+{
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0 && PositionSelectByTicket(ticket))
+      {
+         string symbol = PositionGetString(POSITION_SYMBOL);
+         
+         if(symbol == _Symbol)
+         {
+            double currentSL = PositionGetDouble(POSITION_SL);
+            double currentTP = PositionGetDouble(POSITION_TP);
+            double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+            long type = PositionGetInteger(POSITION_TYPE);
+            
+            if(type == POSITION_TYPE_BUY)
+            {
+               double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+               double newSL = currentPrice - (TrailingStop * point);
+               double newTP = currentPrice + (TakeProfit * point);
+               
+               // Check if we should move the stop loss
+               if(newSL > currentSL && newSL > openPrice)
+               {
+                  // Also check the step condition
+                  if(newSL >= currentSL + (TrailingStep * point))
+                  {
+                     if(trade.PositionModify(ticket, newSL, newTP))
+                     {
+                        Print("Buy trailing updated - SL: ", newSL, " TP: ", newTP);
+                     }
+                     else
+                     {
+                        Print("Error updating buy trailing: ", trade.ResultRetcodeDescription());
+                     }
+                  }
+               }
+            }
+            else if(type == POSITION_TYPE_SELL)
+            {
+               double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+               double newSL = currentPrice + (TrailingStop * point);
+               double newTP = currentPrice - (TakeProfit * point);
+               
+               // Check if we should move the stop loss
+               if((newSL < currentSL || currentSL == 0) && newSL < openPrice)
+               {
+                  // Also check the step condition
+                  if(newSL <= currentSL - (TrailingStep * point) || currentSL == 0)
+                  {
+                     if(trade.PositionModify(ticket, newSL, newTP))
+                     {
+                        Print("Sell trailing updated - SL: ", newSL, " TP: ", newTP);
+                     }
+                     else
+                     {
+                        Print("Error updating sell trailing: ", trade.ResultRetcodeDescription());
+                     }
+                  }
+               }
+            }
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Chart Event function                                             |
+//+------------------------------------------------------------------+
+void OnChartEvent(const int id,         // Event ID
+                  const long& lparam,   // Long parameter
+                  const double& dparam, // Double parameter
+                  const string& sparam) // String parameter
+{
+   //--- Handle mouse clicks
+   if(id == CHARTEVENT_OBJECT_CLICK)
+   {
+      string clickedObject = sparam;
+      
+      //--- Buy button
+      if(clickedObject == "BuyButton")
+      {
+         OpenBuyOrder();
+      }
+      //--- Sell button
+      else if(clickedObject == "SellButton")
+      {
+         OpenSellOrder();
+      }
+      //--- Close All button
+      else if(clickedObject == "CloseAllButton")
+      {
+         CloseAllPositions();
+      }
+      //--- Set SL/TP for existing trades
+      else if(clickedObject == "SetSLTPButton")
+      {
+         CheckExistingPositions();
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Create control buttons on chart                                  |
+//+------------------------------------------------------------------+
+void CreateButtons()
+{
+   //--- Create Buy button
+   ObjectCreate(0, "BuyButton", OBJ_BUTTON, 0, 0, 0);
+   ObjectSetInteger(0, "BuyButton", OBJPROP_XDISTANCE, 10);
+   ObjectSetInteger(0, "BuyButton", OBJPROP_YDISTANCE, 50);
+   ObjectSetInteger(0, "BuyButton", OBJPROP_XSIZE, 80);
+   ObjectSetInteger(0, "BuyButton", OBJPROP_YSIZE, 30);
+   ObjectSetString(0, "BuyButton", OBJPROP_TEXT, "BUY");
+   ObjectSetInteger(0, "BuyButton", OBJPROP_COLOR, clrWhite);
+   ObjectSetInteger(0, "BuyButton", OBJPROP_BGCOLOR, clrGreen);
+   
+   //--- Create Sell button
+   ObjectCreate(0, "SellButton", OBJ_BUTTON, 0, 0, 0);
+   ObjectSetInteger(0, "SellButton", OBJPROP_XDISTANCE, 100);
+   ObjectSetInteger(0, "SellButton", OBJPROP_YDISTANCE, 50);
+   ObjectSetInteger(0, "SellButton", OBJPROP_XSIZE, 80);
+   ObjectSetInteger(0, "SellButton", OBJPROP_YSIZE, 30);
+   ObjectSetString(0, "SellButton", OBJPROP_TEXT, "SELL");
+   ObjectSetInteger(0, "SellButton", OBJPROP_COLOR, clrWhite);
+   ObjectSetInteger(0, "SellButton", OBJPROP_BGCOLOR, clrRed);
+   
+   //--- Create Close All button
+   ObjectCreate(0, "CloseAllButton", OBJ_BUTTON, 0, 0, 0);
+   ObjectSetInteger(0, "CloseAllButton", OBJPROP_XDISTANCE, 190);
+   ObjectSetInteger(0, "CloseAllButton", OBJPROP_YDISTANCE, 50);
+   ObjectSetInteger(0, "CloseAllButton", OBJPROP_XSIZE, 80);
+   ObjectSetInteger(0, "CloseAllButton", OBJPROP_YSIZE, 30);
+   ObjectSetString(0, "CloseAllButton", OBJPROP_TEXT, "CLOSE ALL");
+   ObjectSetInteger(0, "CloseAllButton", OBJPROP_COLOR, clrWhite);
+   ObjectSetInteger(0, "CloseAllButton", OBJPROP_BGCOLOR, clrBlue);
+   
+   //--- Create Set SL/TP button
+   ObjectCreate(0, "SetSLTPButton", OBJ_BUTTON, 0, 0, 0);
+   ObjectSetInteger(0, "SetSLTPButton", OBJPROP_XDISTANCE, 280);
+   ObjectSetInteger(0, "SetSLTPButton", OBJPROP_YDISTANCE, 50);
+   ObjectSetInteger(0, "SetSLTPButton", OBJPROP_XSIZE, 80);
+   ObjectSetInteger(0, "SetSLTPButton", OBJPROP_YSIZE, 30);
+   ObjectSetString(0, "SetSLTPButton", OBJPROP_TEXT, "SET SL/TP");
+   ObjectSetInteger(0, "SetSLTPButton", OBJPROP_COLOR, clrWhite);
+   ObjectSetInteger(0, "SetSLTPButton", OBJPROP_BGCOLOR, clrOrange);
+}
