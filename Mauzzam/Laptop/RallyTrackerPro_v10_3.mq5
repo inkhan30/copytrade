@@ -1,0 +1,839 @@
+//+------------------------------------------------------------------+
+//| Expert Advisor: Dynamic Hedging Martingale                       |
+//|                Custom Trigger Distances and Lot Sizes Version    |
+//+------------------------------------------------------------------+
+#property strict
+#property indicator_chart_window
+
+input bool     EnableStrategy      = true;        // Initial enable state
+input bool     EnableEquityStop    = false;       // Enable/disable equity stop protection
+input double   MaxEquityDrawdownPercent = 20.0;   // Max allowed equity drawdown percentage (if enabled)
+input bool     RestartAfterDrawdown = true;       // Restart strategy after drawdown (if false, stops completely)
+input int      ConsecutiveCandles  = 2;
+input double   InitialLotSize      = 0.01;
+input string   CustomLots          = "0.01,0.02,0.03"; // Comma-separated lot sizes for hedge positions
+input int      InitialTPPips       = 100;        // Take-profit in pips
+input string   TriggerPipsArray    = "700,1400,2100"; // Comma-separated trigger distances
+input int      ProfitTargetPips    = 1000;       // Total profit target in pips
+input int      MagicNumber         = 123456;
+input bool     UseEMAFilter        = true;       // Enable/disable 200 EMA filter
+input int      EMA_Period          = 200;        // EMA period for trend filter
+input int      LastPositionSLPips  = 200;        // Stop-loss in pips for the last hedge position
+
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+#include <Arrays\ArrayInt.mqh>
+#include <Arrays\ArrayDouble.mqh>
+CTrade trade;
+CPositionInfo positionInfo;
+CArrayInt triggerPips; // Array to store trigger pip values
+CArrayDouble customLotsArray; // Array to store custom lot sizes
+
+// Global variables
+bool strategyEnabled; // Track current strategy state (can be modified)
+int direction = 0; // 1 for Buy, -1 for Sell
+bool initialTradeOpened = false;
+bool equityStopTriggered = false;
+datetime lastHedgeTime = 0;
+double highestEquity = 0;
+double initialEntryPrice = 0;
+int emaHandle = INVALID_HANDLE; // Handle for EMA indicator
+#define PIP 10
+
+// Objects for displaying information on chart
+string capitalLabel = "CapitalLabel";
+string capitalValue = "CapitalValue";
+string marginLabel = "MarginLabel";
+string marginValue = "MarginValue";
+string tpLabel = "TPLabel";
+string tpValue = "TPValue";
+string profitTargetLabel = "ProfitTargetLabel";
+string profitTargetValue = "ProfitTargetValue";
+string beLabel = "BreakEvenLabel";
+string beValue = "BreakEvenValue";
+string statusLabel = "StatusLabel";
+string statusValue = "StatusValue";
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   strategyEnabled = EnableStrategy; // Initialize with input value
+   // Parse the TriggerPipsArray string into the triggerPips array
+   if(!ParseTriggerPipsArray())
+   {
+      Print("Error parsing TriggerPipsArray! Using default values");
+      return INIT_FAILED;
+   }
+   
+   // Parse the CustomLots string into the customLotsArray
+   if(!ParseCustomLotsArray())
+   {
+      Print("Error parsing CustomLots! Using default values");
+      return INIT_FAILED;
+   }
+   
+   // Verify that both arrays have the same size
+   if(triggerPips.Total() != customLotsArray.Total())
+   {
+      Print("Error: TriggerPipsArray and CustomLots must have the same number of elements!");
+      return INIT_FAILED;
+   }
+   
+   // Create EMA indicator handle if filter is enabled
+   if(UseEMAFilter)
+   {
+      emaHandle = iMA(_Symbol, _Period, EMA_Period, 0, MODE_EMA, PRICE_CLOSE);
+      if(emaHandle == INVALID_HANDLE)
+      {
+         Print("Failed to create EMA indicator!");
+         return(INIT_FAILED);
+      }
+   }
+   
+   highestEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   equityStopTriggered = false; // Reset on init
+   
+   // Create chart objects for display
+   CreateInfoLabels();
+   
+   // Print the configured lot sizes
+   PrintConfiguredLotSizes();
+   
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Parse the TriggerPipsArray string into an array                  |
+//+------------------------------------------------------------------+
+bool ParseTriggerPipsArray()
+{
+   string values[];
+   int count = StringSplit(TriggerPipsArray, ',', values);
+   
+   if(count <= 0)
+   {
+      Print("No values found in TriggerPipsArray!");
+      return false;
+   }
+   
+   // Clear and initialize the array
+   triggerPips.Clear();
+   
+   for(int i = 0; i < count; i++)
+   {
+      string temp = values[i];
+      StringTrimLeft(temp);
+      StringTrimRight(temp);
+      int pipValue = (int)StringToInteger(temp);
+      if(pipValue <= 0)
+      {
+         Print("Invalid pip value in TriggerPipsArray: ", temp);
+         return false;
+      }
+      triggerPips.Add(pipValue);
+   }
+   
+   Print("Successfully parsed ", triggerPips.Total(), " trigger pip values");
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Parse the CustomLots string into an array                        |
+//+------------------------------------------------------------------+
+bool ParseCustomLotsArray()
+{
+   string values[];
+   int count = StringSplit(CustomLots, ',', values);
+   
+   if(count <= 0)
+   {
+      Print("No values found in CustomLots!");
+      return false;
+   }
+   
+   // Clear and initialize the array
+   customLotsArray.Clear();
+   
+   for(int i = 0; i < count; i++)
+   {
+      string temp = values[i];
+      StringTrimLeft(temp);
+      StringTrimRight(temp);
+      double lotValue = StringToDouble(temp);
+      if(lotValue <= 0)
+      {
+         Print("Invalid lot value in CustomLots: ", temp);
+         return false;
+      }
+      customLotsArray.Add(lotValue);
+   }
+   
+   Print("Successfully parsed ", customLotsArray.Total(), " custom lot values");
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Get current EMA value                                            |
+//+------------------------------------------------------------------+
+double GetEMAValue()
+{
+   if(emaHandle == INVALID_HANDLE) return 0;
+   
+   double emaValue[1];
+   if(CopyBuffer(emaHandle, 0, 0, 1, emaValue) != 1)
+   {
+      Print("Failed to copy EMA buffer!");
+      return 0;
+   }
+   
+   return emaValue[0];
+}
+
+//+------------------------------------------------------------------+
+//| Print the configured lot sizes                                   |
+//+------------------------------------------------------------------+
+void PrintConfiguredLotSizes()
+{
+   string lotSizesStr = "Configured Lot Sizes: [";
+   
+   for(int i = 0; i < customLotsArray.Total(); i++)
+   {
+      lotSizesStr += DoubleToString(customLotsArray.At(i), 2);
+      if(i < customLotsArray.Total() - 1) lotSizesStr += ", ";
+   }
+   lotSizesStr += "]";
+   
+   Print(lotSizesStr);
+   Print("Last position will have SL of ", LastPositionSLPips, " pips");
+}
+
+//+------------------------------------------------------------------+
+//| Get lot size for the specified position index                    |
+//+------------------------------------------------------------------+
+double GetLotSize(int positionIndex)
+{
+   if(positionIndex == 0) return InitialLotSize;
+   
+   // For hedge positions (index > 0), use the custom lots array
+   int hedgeIndex = positionIndex - 1; // First hedge is at index 1, which corresponds to array index 0
+   
+   if(hedgeIndex < customLotsArray.Total())
+   {
+      return NormalizeDouble(customLotsArray.At(hedgeIndex), 2);
+   }
+   
+   // If we somehow get here, return the last custom lot size
+   return NormalizeDouble(customLotsArray.At(customLotsArray.Total()-1), 2);
+}
+
+//+------------------------------------------------------------------+
+//| Check EMA filter condition                                       |
+//+------------------------------------------------------------------+
+bool CheckEMAFilter(int &dir)
+{
+   if(!UseEMAFilter) return true; // If filter disabled, always return true
+   
+   double emaValue = GetEMAValue();
+   if(emaValue == 0) return false; // Failed to get EMA value
+   
+   double currentClose = iClose(_Symbol, _Period, 1);
+   
+   if(currentClose > emaValue)
+   {
+      dir = 1; // Only allow buy trades
+      return true;
+   }
+   else if(currentClose < emaValue)
+   {
+      dir = -1; // Only allow sell trades
+      return true;
+   }
+   
+   return false; // Price exactly at EMA - no trades
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   // Release EMA indicator handle
+   if(emaHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(emaHandle);
+   }
+   
+   // Remove chart objects when EA is removed
+   ObjectDelete(0, capitalLabel);
+   ObjectDelete(0, capitalValue);
+   ObjectDelete(0, marginLabel);
+   ObjectDelete(0, marginValue);
+   ObjectDelete(0, tpLabel);
+   ObjectDelete(0, tpValue);
+   ObjectDelete(0, profitTargetLabel);
+   ObjectDelete(0, profitTargetValue);
+   ObjectDelete(0, beLabel);
+   ObjectDelete(0, beValue);
+   ObjectDelete(0, statusLabel);
+   ObjectDelete(0, statusValue);
+}
+
+//+------------------------------------------------------------------+
+//| Create information labels on chart                               |
+//+------------------------------------------------------------------+
+void CreateInfoLabels()
+{
+   int verticalSpacing = 25; // Increased from 20 to 25 for better spacing
+   int startY = 20; // Starting Y position
+   int labelX = 10; // X position for labels
+   int valueX = 170; // X position for values (increased from 100 to 170 for better alignment)
+   
+   // Capital label
+   ObjectCreate(0, capitalLabel, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, capitalLabel, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, capitalLabel, OBJPROP_XDISTANCE, labelX);
+   ObjectSetInteger(0, capitalLabel, OBJPROP_YDISTANCE, startY);
+   ObjectSetInteger(0, capitalLabel, OBJPROP_COLOR, clrLime);
+   ObjectSetString(0, capitalLabel, OBJPROP_TEXT, "Capital:");
+   ObjectSetInteger(0, capitalLabel, OBJPROP_FONTSIZE, 10);
+   
+   // Capital value
+   ObjectCreate(0, capitalValue, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, capitalValue, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, capitalValue, OBJPROP_XDISTANCE, valueX);
+   ObjectSetInteger(0, capitalValue, OBJPROP_YDISTANCE, startY);
+   ObjectSetInteger(0, capitalValue, OBJPROP_COLOR, clrYellow);
+   ObjectSetString(0, capitalValue, OBJPROP_TEXT, "N/A");
+   ObjectSetInteger(0, capitalValue, OBJPROP_FONTSIZE, 10);
+   
+   // Margin label (added extra space before this group)
+   startY += verticalSpacing + 5;
+   ObjectCreate(0, marginLabel, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, marginLabel, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, marginLabel, OBJPROP_XDISTANCE, labelX);
+   ObjectSetInteger(0, marginLabel, OBJPROP_YDISTANCE, startY);
+   ObjectSetInteger(0, marginLabel, OBJPROP_COLOR, clrLime);
+   ObjectSetString(0, marginLabel, OBJPROP_TEXT, "Margin Used:");
+   ObjectSetInteger(0, marginLabel, OBJPROP_FONTSIZE, 10);
+   
+   // Margin value
+   ObjectCreate(0, marginValue, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, marginValue, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, marginValue, OBJPROP_XDISTANCE, valueX);
+   ObjectSetInteger(0, marginValue, OBJPROP_YDISTANCE, startY);
+   ObjectSetInteger(0, marginValue, OBJPROP_COLOR, clrYellow);
+   ObjectSetString(0, marginValue, OBJPROP_TEXT, "N/A");
+   ObjectSetInteger(0, marginValue, OBJPROP_FONTSIZE, 10);
+   
+   // TP price label (added extra space before this group)
+   startY += verticalSpacing + 5;
+   ObjectCreate(0, tpLabel, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, tpLabel, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, tpLabel, OBJPROP_XDISTANCE, labelX);
+   ObjectSetInteger(0, tpLabel, OBJPROP_YDISTANCE, startY);
+   ObjectSetInteger(0, tpLabel, OBJPROP_COLOR, clrLime);
+   ObjectSetString(0, tpLabel, OBJPROP_TEXT, "TP Price:");
+   ObjectSetInteger(0, tpLabel, OBJPROP_FONTSIZE, 10);
+   
+   // TP price value
+   ObjectCreate(0, tpValue, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, tpValue, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, tpValue, OBJPROP_XDISTANCE, valueX);
+   ObjectSetInteger(0, tpValue, OBJPROP_YDISTANCE, startY);
+   ObjectSetInteger(0, tpValue, OBJPROP_COLOR, clrYellow);
+   ObjectSetString(0, tpValue, OBJPROP_TEXT, "N/A");
+   ObjectSetInteger(0, tpValue, OBJPROP_FONTSIZE, 10);
+   
+   // Profit target label (regular spacing)
+   startY += verticalSpacing;
+   ObjectCreate(0, profitTargetLabel, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, profitTargetLabel, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, profitTargetLabel, OBJPROP_XDISTANCE, labelX);
+   ObjectSetInteger(0, profitTargetLabel, OBJPROP_YDISTANCE, startY);
+   ObjectSetInteger(0, profitTargetLabel, OBJPROP_COLOR, clrLime);
+   ObjectSetString(0, profitTargetLabel, OBJPROP_TEXT, "Profit Target:");
+   ObjectSetInteger(0, profitTargetLabel, OBJPROP_FONTSIZE, 10);
+   
+   // Profit target value
+   ObjectCreate(0, profitTargetValue, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, profitTargetValue, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, profitTargetValue, OBJPROP_XDISTANCE, valueX);
+   ObjectSetInteger(0, profitTargetValue, OBJPROP_YDISTANCE, startY);
+   ObjectSetInteger(0, profitTargetValue, OBJPROP_COLOR, clrYellow);
+   ObjectSetString(0, profitTargetValue, OBJPROP_TEXT, "N/A");
+   ObjectSetInteger(0, profitTargetValue, OBJPROP_FONTSIZE, 10);
+   
+   // Break-even label (added extra space before this group)
+   startY += verticalSpacing + 5;
+   ObjectCreate(0, beLabel, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, beLabel, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, beLabel, OBJPROP_XDISTANCE, labelX);
+   ObjectSetInteger(0, beLabel, OBJPROP_YDISTANCE, startY);
+   ObjectSetInteger(0, beLabel, OBJPROP_COLOR, clrLime);
+   ObjectSetString(0, beLabel, OBJPROP_TEXT, "Break-even:");
+   ObjectSetInteger(0, beLabel, OBJPROP_FONTSIZE, 10);
+   
+   // Break-even value
+   ObjectCreate(0, beValue, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, beValue, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, beValue, OBJPROP_XDISTANCE, valueX);
+   ObjectSetInteger(0, beValue, OBJPROP_YDISTANCE, startY);
+   ObjectSetInteger(0, beValue, OBJPROP_COLOR, clrYellow);
+   ObjectSetString(0, beValue, OBJPROP_TEXT, "N/A");
+   ObjectSetInteger(0, beValue, OBJPROP_FONTSIZE, 10);
+   
+   // Status label (added at bottom)
+   startY += verticalSpacing + 10;
+   ObjectCreate(0, statusLabel, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, statusLabel, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, statusLabel, OBJPROP_XDISTANCE, labelX);
+   ObjectSetInteger(0, statusLabel, OBJPROP_YDISTANCE, startY);
+   ObjectSetInteger(0, statusLabel, OBJPROP_COLOR, clrLime);
+   ObjectSetString(0, statusLabel, OBJPROP_TEXT, "Status:");
+   ObjectSetInteger(0, statusLabel, OBJPROP_FONTSIZE, 10);
+   
+   ObjectCreate(0, statusValue, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, statusValue, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, statusValue, OBJPROP_XDISTANCE, valueX);
+   ObjectSetInteger(0, statusValue, OBJPROP_YDISTANCE, startY);
+   ObjectSetInteger(0, statusValue, OBJPROP_COLOR, clrYellow);
+   ObjectSetString(0, statusValue, OBJPROP_TEXT, "Running");
+   ObjectSetInteger(0, statusValue, OBJPROP_FONTSIZE, 10);
+}
+
+//+------------------------------------------------------------------+
+//| Update information on chart                                      |
+//+------------------------------------------------------------------+
+void UpdateChartInfo()
+{
+   // Update capital and margin information
+   double capital = AccountInfoDouble(ACCOUNT_BALANCE);
+   double margin = AccountInfoDouble(ACCOUNT_MARGIN);
+   ObjectSetString(0, capitalValue, OBJPROP_TEXT, DoubleToString(capital, 2));
+   ObjectSetString(0, marginValue, OBJPROP_TEXT, DoubleToString(margin, 2));
+   
+   // Update profit target
+   ObjectSetString(0, profitTargetValue, OBJPROP_TEXT, DoubleToString(ProfitTargetPips, 0) + " pips");
+   
+   int totalPositions = CountOpenTrades();
+   
+   if(totalPositions == 0)
+   {
+      ObjectSetString(0, tpValue, OBJPROP_TEXT, "N/A");
+      ObjectSetString(0, beValue, OBJPROP_TEXT, "N/A");
+      return;
+   }
+   
+   // Check if initial position still has TP
+   bool hasTP = false;
+   double tpPrice = 0;
+   
+   for(int i = PositionsTotal()-1; i >=0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      
+      double tp = PositionGetDouble(POSITION_TP);
+      if(tp != 0)
+      {
+         hasTP = true;
+         tpPrice = tp;
+         break;
+      }
+   }
+   
+   if(hasTP)
+   {
+      ObjectSetString(0, tpValue, OBJPROP_TEXT, DoubleToString(tpPrice, _Digits));
+   }
+   else
+   {
+      ObjectSetString(0, tpValue, OBJPROP_TEXT, "No TP set");
+   }
+   
+   // Calculate break-even price
+   double totalLots = 0;
+   double weightedPrice = 0;
+   
+   for(int i = PositionsTotal()-1; i >=0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      
+      double lot = PositionGetDouble(POSITION_VOLUME);
+      double price = PositionGetDouble(POSITION_PRICE_OPEN);
+      
+      totalLots += lot;
+      weightedPrice += lot * price;
+   }
+   
+   if(totalLots > 0)
+   {
+      double breakEvenPrice = weightedPrice / totalLots;
+      ObjectSetString(0, beValue, OBJPROP_TEXT, DoubleToString(breakEvenPrice, _Digits));
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   if(!strategyEnabled) return; // Use the modifiable variable
+
+   UpdateHighestEquity();
+   
+   // Check equity stop if enabled and not already triggered
+   if(EnableEquityStop && !equityStopTriggered && CheckEquityStop())
+   {
+      equityStopTriggered = true;
+      CloseAllTrades();
+      
+      if(RestartAfterDrawdown)
+      {
+         // Reset strategy state but keep monitoring equity
+         initialTradeOpened = false;
+         initialEntryPrice = 0;
+         direction = 0;
+         highestEquity = AccountInfoDouble(ACCOUNT_EQUITY); // Reset highest equity
+         Alert("Drawdown limit hit! Strategy reset and waiting for new signal.");
+         UpdateStatusLabel("Drawdown - Reset");
+      }
+      else
+      {
+         // Completely stop the strategy
+         strategyEnabled = false; // This is now allowed
+         Alert("Drawdown limit hit! Strategy stopped completely.");
+         UpdateStatusLabel("Stopped (Drawdown)");
+         return;
+      }
+   }
+   
+   // If equity stop was triggered but we're restarting, check if we can resume
+   if(equityStopTriggered && RestartAfterDrawdown)
+   {
+      // Check if equity has recovered enough (optional - you can remove this if you want immediate restart)
+      double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      double recoveryLevel = highestEquity * (1 - MaxEquityDrawdownPercent/200); // Allow half the drawdown for recovery
+      
+      if(currentEquity >= recoveryLevel)
+      {
+         equityStopTriggered = false;
+         Alert("Equity recovered - strategy resuming");
+         UpdateStatusLabel("Running");
+      }
+      else
+      {
+         return; // Wait for recovery
+      }
+   }
+   
+   // Normal trading logic
+   int totalTrades = CountOpenTrades();
+   if(totalTrades == 0)
+   {
+      // First check EMA filter if enabled
+      int emaDirection = 0;
+      if(UseEMAFilter && !CheckEMAFilter(emaDirection))
+      {
+         return; // EMA filter condition not met
+      }
+      
+      // Then check consecutive candles
+      if(CheckConsecutiveCandles(direction))
+      {
+         // If EMA filter is enabled, verify direction matches EMA
+         if(UseEMAFilter && direction != emaDirection)
+         {
+            return; // Direction doesn't match EMA filter
+         }
+         
+         initialTradeOpened = true;
+         initialEntryPrice = SymbolInfoDouble(_Symbol, direction == 1 ? SYMBOL_ASK : SYMBOL_BID);
+         trade.SetExpertMagicNumber(MagicNumber);
+         Print("First Trade at price: ", initialEntryPrice);
+         trade.PositionOpen(_Symbol, direction == 1 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,
+                           InitialLotSize, initialEntryPrice,
+                           0,
+                           initialEntryPrice + (direction == 1 ? InitialTPPips : -InitialTPPips) * PIP * _Point);
+                           
+         //counter trade
+         trade.PositionOpen(_Symbol, direction == 1 ? ORDER_TYPE_SELL : ORDER_TYPE_BUY,
+                           InitialLotSize, initialEntryPrice,
+                           0,
+                           initialEntryPrice + (direction == 1 ? -InitialTPPips : InitialTPPips) * PIP * _Point);
+      }
+   }
+   else if(totalTrades <= triggerPips.Total()) // Changed to use triggerPips count
+   {
+      ManageHedging();
+   }
+
+   double totalProfit = GetTotalUnrealizedProfit();
+   if(totalProfit >= ProfitTargetPips * PIP * _Point)
+   {
+      CloseAllTrades();
+      initialTradeOpened = false;
+      initialEntryPrice = 0;
+   }
+   
+   // Update chart information on every tick
+   UpdateChartInfo();
+}
+
+//+------------------------------------------------------------------+
+//| Update status label on chart                                     |
+//+------------------------------------------------------------------+
+void UpdateStatusLabel(string text)
+{
+   if(ObjectFind(0, statusValue) < 0) return;
+   ObjectSetString(0, statusValue, OBJPROP_TEXT, text);
+   
+   // Change color based on status
+   color clr = clrYellow;
+   if(StringFind(text, "Running") >= 0) clr = clrLime;
+   else if(StringFind(text, "Drawdown") >= 0) clr = clrOrangeRed;
+   else if(StringFind(text, "Stopped") >= 0) clr = clrRed;
+   
+   ObjectSetInteger(0, statusValue, OBJPROP_COLOR, clr);
+}
+
+//+------------------------------------------------------------------+
+//| Check equity drawdown                                            |
+//+------------------------------------------------------------------+
+bool CheckEquityStop()
+{
+   double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double drawdownPercent = 0;
+   
+   if(highestEquity > 0)
+   {
+      drawdownPercent = ((highestEquity - currentEquity) / highestEquity) * 100;
+   }
+   
+   return drawdownPercent >= MaxEquityDrawdownPercent;
+}
+
+//+------------------------------------------------------------------+
+//| Count open trades                                                |
+//+------------------------------------------------------------------+
+int CountOpenTrades()
+{
+   int count = 0;
+   for (int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if (PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+         count++;
+   }
+   return count;
+}
+
+//+------------------------------------------------------------------+
+//| Check consecutive candles                                        |
+//+------------------------------------------------------------------+
+bool CheckConsecutiveCandles(int &dir)
+{
+   bool bullish = true;
+   bool bearish = true;
+   double openArray[1], closeArray[1];
+
+   for (int i = 1; i <= ConsecutiveCandles; i++)
+   {
+      if (CopyOpen(_Symbol, _Period, i, 1, openArray) != 1 ||
+          CopyClose(_Symbol, _Period, i, 1, closeArray) != 1)
+         return false;
+
+      if (closeArray[0] <= openArray[0]) bullish = false;
+      if (closeArray[0] >= openArray[0]) bearish = false;
+   }
+
+   if (bullish) { dir = 1; return true; }
+   if (bearish) { dir = -1; return true; }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Manage hedging with custom trigger distances                     |
+//+------------------------------------------------------------------+
+void ManageHedging()
+{
+   if(initialEntryPrice == 0) return;
+    
+   double currentPrice = SymbolInfoDouble(_Symbol, direction == 1 ? SYMBOL_BID : SYMBOL_ASK);
+   int openCount = CountOpenTrades();
+   
+   if(openCount > triggerPips.Total()) return; // Changed to use triggerPips count
+   
+   // Calculate trigger price based on the custom array
+   double triggerPrice = CalculateHedgeTriggerPrice(openCount);
+   if(triggerPrice == 0) return;
+   
+   bool conditionMet = false;
+   if(direction == 1 && currentPrice <= triggerPrice)
+   {
+      conditionMet = true;
+   }
+   else if(direction == -1 && currentPrice >= triggerPrice)
+   {
+      conditionMet = true;
+   }
+   
+   if(conditionMet)
+   {
+      double lot = GetLotSize(openCount);
+      double entryPrice = SymbolInfoDouble(_Symbol, direction == 1 ? SYMBOL_ASK : SYMBOL_BID);
+      trade.SetExpertMagicNumber(MagicNumber);
+      
+      // Check if this is the last position
+      bool isLastPosition = (openCount == triggerPips.Total()); // Changed to use triggerPips count
+      
+      if(isLastPosition && LastPositionSLPips > 0)
+      {
+         // For last position, set SL
+         double slPrice = entryPrice + (direction == 1 ? -LastPositionSLPips : LastPositionSLPips) * PIP * _Point;
+         trade.PositionOpen(_Symbol, direction == 1 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,
+                           lot, entryPrice, slPrice, 0);
+         Print("Last hedge position #", openCount, " opened with SL at ", slPrice);
+         trade.PositionOpen(_Symbol, direction == 1 ? ORDER_TYPE_SELL : ORDER_TYPE_BUY,
+                           lot, entryPrice, slPrice, 0);
+      }
+      else
+      {
+         // For other positions, no SL
+         trade.PositionOpen(_Symbol, direction == 1 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,
+                           lot, entryPrice, 0, 0);
+         trade.PositionOpen(_Symbol, direction == 1 ? ORDER_TYPE_SELL : ORDER_TYPE_BUY,
+                           lot, entryPrice, 0, 0);
+      }
+      
+      Print("Hedge #", openCount, " opened at ", entryPrice, 
+            " (Trigger: ", triggerPrice, 
+            " Pips from initial: ", GetTotalTriggerPips(openCount), ")");
+      
+      if(openCount == 1)
+      {
+         RemoveInitialPositionTP();
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Remove TP from initial position                                  |
+//+------------------------------------------------------------------+
+void RemoveInitialPositionTP()
+{
+   ulong initialTicket = 0;
+   datetime earliestTime = D'3000.01.01';
+   
+   for(int i = PositionsTotal()-1; i >=0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      datetime posTime = PositionGetInteger(POSITION_TIME);
+      if(posTime < earliestTime)
+      {
+         earliestTime = posTime;
+         initialTicket = ticket;
+      }
+   }
+   
+   if(initialTicket == 0) return;
+   
+   if(positionInfo.SelectByTicket(initialTicket))
+   {
+      trade.PositionModify(initialTicket, positionInfo.StopLoss(), 0);
+      Print("Removed TP from initial position #", initialTicket);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get total unrealized profit                                      |
+//+------------------------------------------------------------------+
+double GetTotalUnrealizedProfit()
+{
+   double profit = 0;
+   for (int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if (PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+         profit += PositionGetDouble(POSITION_PROFIT);
+   }
+   return profit;
+}
+
+//+------------------------------------------------------------------+
+//| Close all trades                                                 |
+//+------------------------------------------------------------------+
+void CloseAllTrades()
+{
+   for (int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if (PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+      {
+         string symbol = PositionGetString(POSITION_SYMBOL);
+         trade.PositionClose(symbol);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Update highest equity                                            |
+//+------------------------------------------------------------------+
+void UpdateHighestEquity()
+{
+   double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(currentEquity > highestEquity)
+   {
+      highestEquity = currentEquity;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate hedge trigger price based on position count            |
+//+------------------------------------------------------------------+
+double CalculateHedgeTriggerPrice(int positionCount)
+{
+   if(positionCount == 0 || positionCount > triggerPips.Total()) 
+      return 0; // No trigger price for initial position or if beyond our array
+   
+   // Calculate cumulative pips from initial entry for this hedge level
+   int totalPips = 0;
+   for(int i = 0; i < positionCount; i++)
+   {
+      totalPips += triggerPips.At(i);
+   }
+   
+   if(direction == 1)
+   {
+      // For buy direction, hedges go down in price
+      return initialEntryPrice - totalPips * PIP * _Point;
+   }
+   else
+   {
+      // For sell direction, hedges go up in price
+      return initialEntryPrice + totalPips * PIP * _Point;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get total trigger pips for a given position count                |
+//+------------------------------------------------------------------+
+int GetTotalTriggerPips(int positionCount)
+{
+   int total = 0;
+   for(int i = 0; i < positionCount && i < triggerPips.Total(); i++)
+   {
+      total += triggerPips.At(i);
+   }
+   return total;
+}
