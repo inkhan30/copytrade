@@ -1,0 +1,15 @@
+BUY:
+
+Price is above 50 EMA (trend up)
+
+RSI touches 30–40 and reverses up (we use RSI crossing above 35 from below)
+
+Candle closes bullish above EMA
+
+SELL:
+
+Price is below 50 EMA
+
+RSI touches 60–70 and reverses down (we use RSI crossing below 65 from above)
+
+Candle closes bearish below EMA
