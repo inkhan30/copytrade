@@ -1,0 +1,103 @@
+//+------------------------------------------------------------------+
+//|                      XAUUSD_VerySimple.mq5                      |
+//+------------------------------------------------------------------+
+#property copyright "Gold EA"
+#property version   "1.00"
+
+input double LotSize = 0.01;
+input double TP = 20;
+input double SL = 10;
+
+datetime lastTradeTime;
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // Don't trade if already in position
+   if(PositionsTotal() > 0) return;
+   
+   // Only trade once per minute to avoid multiple signals
+   if(TimeCurrent() - lastTradeTime < 60) return;
+   
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   
+   // Create indicator handles
+   int emaHandle = iMA(_Symbol, PERIOD_CURRENT, 50, 0, MODE_EMA, PRICE_CLOSE);
+   int rsiHandle = iRSI(_Symbol, PERIOD_CURRENT, 14, PRICE_CLOSE);
+   
+   // Get values
+   double emaVal[1], rsiVal[1];
+   CopyBuffer(emaHandle, 0, 0, 1, emaVal);
+   CopyBuffer(rsiHandle, 0, 0, 1, rsiVal);
+   
+   // Clean up
+   IndicatorRelease(emaHandle);
+   IndicatorRelease(rsiHandle);
+   
+   // Simple conditions
+   if(bid > emaVal[0] && rsiVal[0] < 40)
+   {
+      PlaceBuy();
+   }
+   else if(bid < emaVal[0] && rsiVal[0] > 60)
+   {
+      PlaceSell();
+   }
+}
+
+//+------------------------------------------------------------------+
+void PlaceBuy()
+{
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   
+   MqlTradeRequest req = {};
+   MqlTradeResult res = {};
+   
+   req.action = TRADE_ACTION_DEAL;
+   req.symbol = _Symbol;
+   req.volume = LotSize;
+   req.type = ORDER_TYPE_BUY;
+   req.price = ask;
+   req.sl = ask - SL * 10 * point;
+   req.tp = ask + TP * 10 * point;
+   req.deviation = 10;
+   req.magic = 123;
+   
+   if(OrderSend(req, res))
+   {
+      lastTradeTime = TimeCurrent();
+      Print("Buy order placed");
+   }
+}
+
+//+------------------------------------------------------------------+
+void PlaceSell()
+{
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   
+   MqlTradeRequest req = {};
+   MqlTradeResult res = {};
+   
+   req.action = TRADE_ACTION_DEAL;
+   req.symbol = _Symbol;
+   req.volume = LotSize;
+   req.type = ORDER_TYPE_SELL;
+   req.price = bid;
+   req.sl = bid + SL * 10 * point;
+   req.tp = bid - TP * 10 * point;
+   req.deviation = 10;
+   req.magic = 123;
+   
+   if(OrderSend(req, res))
+   {
+      lastTradeTime = TimeCurrent();
+      Print("Sell order placed");
+   }
+}
+//+------------------------------------------------------------------+

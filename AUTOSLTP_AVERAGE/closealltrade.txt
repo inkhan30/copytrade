@@ -1,0 +1,248 @@
+//+------------------------------------------------------------------+
+//| Simple Profit Tracker EA.mq5                                    |
+//| Copyright 2024, Forex EA                                        |
+//+------------------------------------------------------------------+
+
+#property copyright "Forex EA"
+#property version   "1.00"
+#property description "Close all trades when profit target reached with USD trailing"
+
+// Profit Target Parameters
+input bool     EnableProfitTracking = true;     // Enable profit tracking
+input double   CloseAllProfitUSD = 5.0;         // Close all trades when total profit reaches (USD)
+input double   CloseAllTrailStepUSD = 2.0;      // Trailing step for closing all trades (USD)
+input bool     ShowProfitInfo = true;           // Show profit information on chart
+
+// Global variables
+double maxTotalProfitUSD = 0.0;
+bool profitTargetReached = false;
+datetime lastPrintTime = 0;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+    Print("=== Simple Profit Tracker EA Started ===");
+    Print("Settings: Close All Profit = $", CloseAllProfitUSD, " | Trail Step = $", CloseAllTrailStepUSD);
+    Print("EA will only close all trades when profit target is reached with trailing");
+    Print("You handle all manual trading and averaging");
+    
+    return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+    ObjectDelete(0, "ProfitInfo");
+    Print("Simple Profit Tracker EA removed");
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+    if(!EnableProfitTracking) return;
+    
+    // Check profit and close trades if conditions met
+    CheckProfitAndClose();
+    
+    // Update display every second
+    if(TimeCurrent() - lastPrintTime >= 1)
+    {
+        UpdateProfitDisplay();
+        lastPrintTime = TimeCurrent();
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Check profit and close all trades if conditions met              |
+//+------------------------------------------------------------------+
+void CheckProfitAndClose()
+{
+    int total = PositionsTotal();
+    if(total == 0) 
+    {
+        // Reset when no positions
+        maxTotalProfitUSD = 0.0;
+        profitTargetReached = false;
+        return;
+    }
+    
+    double currentProfitUSD = CalculateTotalProfitUSD();
+    
+    // Update maximum profit reached
+    if(currentProfitUSD > maxTotalProfitUSD)
+    {
+        maxTotalProfitUSD = currentProfitUSD;
+        
+        // Check if we've reached the initial profit target
+        if(!profitTargetReached && maxTotalProfitUSD >= CloseAllProfitUSD)
+        {
+            profitTargetReached = true;
+            Print("🎯 PROFIT TARGET REACHED: $", DoubleToString(maxTotalProfitUSD, 2));
+            Print("📈 TRAILING ACTIVATED: Will close all trades on $", DoubleToString(CloseAllTrailStepUSD, 2), " retracement");
+        }
+    }
+    
+    // If profit target was reached and current profit has retraced by trail step, close all
+    if(profitTargetReached && currentProfitUSD <= (maxTotalProfitUSD - CloseAllTrailStepUSD))
+    {
+        Print("💰 TRAILING CLOSE TRIGGERED!");
+        Print("   Peak Profit: $", DoubleToString(maxTotalProfitUSD, 2));
+        Print("   Current Profit: $", DoubleToString(currentProfitUSD, 2));
+        Print("   Retracement: $", DoubleToString(maxTotalProfitUSD - currentProfitUSD, 2));
+        Print("   Closing all ", total, " trades...");
+        
+        CloseAllTrades();
+        
+        // Reset tracking
+        maxTotalProfitUSD = 0.0;
+        profitTargetReached = false;
+        
+        Print("✅ All trades closed successfully");
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate total profit in USD for all positions                  |
+//+------------------------------------------------------------------+
+double CalculateTotalProfitUSD()
+{
+    int total = PositionsTotal();
+    double totalProfitUSD = 0.0;
+    
+    for(int i = 0; i < total; i++)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(ticket > 0 && PositionSelectByTicket(ticket))
+        {
+            if(PositionGetString(POSITION_SYMBOL) == _Symbol)
+            {
+                totalProfitUSD += PositionGetDouble(POSITION_PROFIT);
+            }
+        }
+    }
+    
+    return totalProfitUSD;
+}
+
+//+------------------------------------------------------------------+
+//| Close all trades                                                 |
+//+------------------------------------------------------------------+
+void CloseAllTrades()
+{
+    int total = PositionsTotal();
+    int closedCount = 0;
+    
+    for(int i = total - 1; i >= 0; i--)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(ticket > 0 && PositionSelectByTicket(ticket))
+        {
+            if(PositionGetString(POSITION_SYMBOL) == _Symbol)
+            {
+                if(ClosePosition(ticket))
+                    closedCount++;
+            }
+        }
+    }
+    
+    Print("📊 Closed ", closedCount, " out of ", total, " trades");
+}
+
+//+------------------------------------------------------------------+
+//| Close individual position                                        |
+//+------------------------------------------------------------------+
+bool ClosePosition(ulong ticket)
+{
+    MqlTradeRequest request;
+    MqlTradeResult result;
+    ZeroMemory(request);
+    ZeroMemory(result);
+    
+    request.action = TRADE_ACTION_DEAL;
+    request.position = ticket;
+    request.symbol = _Symbol;
+    request.volume = PositionGetDouble(POSITION_VOLUME);
+    request.deviation = 10;
+    
+    if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+    {
+        request.price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+        request.type = ORDER_TYPE_SELL;
+    }
+    else
+    {
+        request.price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+        request.type = ORDER_TYPE_BUY;
+    }
+    
+    request.type_filling = ORDER_FILLING_FOK;
+    
+    bool success = OrderSend(request, result);
+    
+    if(success && result.retcode == TRADE_RETCODE_DONE)
+    {
+        return true;
+    }
+    else
+    {
+        Print("❌ Failed to close position #", ticket, " Error: ", result.retcode);
+        return false;
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Update profit information display                                |
+//+------------------------------------------------------------------+
+void UpdateProfitDisplay()
+{
+    if(!ShowProfitInfo) return;
+    
+    int total = PositionsTotal();
+    double currentProfitUSD = CalculateTotalProfitUSD();
+    
+    string infoText = "Profit Tracker (USD)\n";
+    infoText += "====================\n";
+    infoText += "Current: $" + DoubleToString(currentProfitUSD, 2) + "\n";
+    infoText += "Max: $" + DoubleToString(maxTotalProfitUSD, 2) + "\n";
+    infoText += "Target: $" + DoubleToString(CloseAllProfitUSD, 2) + "\n";
+    infoText += "Trail Step: $" + DoubleToString(CloseAllTrailStepUSD, 2) + "\n";
+    infoText += "Positions: " + IntegerToString(total) + "\n";
+    
+    if(profitTargetReached)
+    {
+        infoText += "Status: 🎯 TRAILING\n";
+        infoText += "Close at: $" + DoubleToString(maxTotalProfitUSD - CloseAllTrailStepUSD, 2);
+    }
+    else if(currentProfitUSD >= CloseAllProfitUSD * 0.8)
+    {
+        infoText += "Status: ⚡ NEAR TARGET";
+    }
+    else
+    {
+        infoText += "Status: 📊 MONITORING";
+    }
+    
+    // Create or update text object
+    if(ObjectFind(0, "ProfitInfo") < 0)
+    {
+        ObjectCreate(0, "ProfitInfo", OBJ_LABEL, 0, 0, 0);
+        ObjectSetInteger(0, "ProfitInfo", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+        ObjectSetInteger(0, "ProfitInfo", OBJPROP_XDISTANCE, 10);
+        ObjectSetInteger(0, "ProfitInfo", OBJPROP_YDISTANCE, 20);
+        ObjectSetInteger(0, "ProfitInfo", OBJPROP_BACK, false);
+        ObjectSetInteger(0, "ProfitInfo", OBJPROP_SELECTABLE, false);
+        ObjectSetInteger(0, "ProfitInfo", OBJPROP_HIDDEN, true);
+        ObjectSetInteger(0, "ProfitInfo", OBJPROP_FONTSIZE, 8);
+        ObjectSetInteger(0, "ProfitInfo", OBJPROP_COLOR, clrWhite);
+    }
+    
+    ObjectSetString(0, "ProfitInfo", OBJPROP_TEXT, infoText);
+}
+
+//+------------------------------------------------------------------+
