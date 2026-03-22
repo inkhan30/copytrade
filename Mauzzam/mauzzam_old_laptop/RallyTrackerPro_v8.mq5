@@ -1,0 +1,387 @@
+//+------------------------------------------------------------------+
+//| Expert Advisor: Dynamic Hedging Martingale                       |
+//|                Reverse Trigger Distances Version                |
+//+------------------------------------------------------------------+
+#property strict
+#property indicator_chart_window
+
+input bool     EnableStrategy      = true;
+input bool     EnableEquityStop    = false;       // Enable/disable equity stop protection
+input double   MaxEquityDrawdownPercent = 20.0;   // Max allowed equity drawdown percentage (if enabled)
+input int      ConsecutiveCandles  = 2;
+input double   InitialLotSize      = 0.01;
+input int      InitialTPPips       = 100;        // Take-profit in pips
+input int      TotalLotCounts      = 30;         // Total number of hedge positions
+input int      IntervalPips        = 500;        // Fixed interval between hedges in pips
+input int      ProfitTargetPips    = 1000;       // Total profit target in pips
+input int      MagicNumber         = 123456;
+
+// Hedge lot sizes array
+//double HedgeLotSizes[] = {0.01,0.02,0.04,0.08,0.16,0.32,0.64,1.28,0.09,0.1}; //,0.11,0.12,0.13,0.14,0.15,0.16,0.17,0.18,0.19,0.20,0.21,0.22,0.23,0.24,0.25,0.26,0.27,0.28,0.29,0.30,0.31,0.32,0.33,0.34,0.35,0.36,0.37,0.38,0.39,0.40,0.41,0.42,0.43,0.44,0.45,0.46,0.47,0.48,0.49,0.50 50 hedge lot sizes
+//double HedgeLotSizes[] = {0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.02,0.02,0.02,0.02,0.02,0.02,0.02,0.02,0.02,0.02,0.03,0.03,0.03,0.03,0.03,0.03,0.03,0.03,0.03,0.03,0.04,0.04,0.04,0.04,0.04,0.04,0.04,0.04,0.04,0.04,0.05,0.05,0.05,0.05,0.05,0.05,0.05,0.05,0.05,0.05}; // 50 hedge lot sizes
+double HedgeLotSizes[] = {0.01,0.03,0.05,0.07,0.09,0.11,0.13,0.15,0.17,0.19,0.21,0.23,0.25,0.27,0.29,0.31,0.33,0.35,0.37,0.39}; // 50 hedge lot sizes
+#include <Trade\Trade.mqh>
+#include <Trade\PositionInfo.mqh>
+CTrade trade;
+CPositionInfo positionInfo;
+
+// Global variables
+int direction = 0; // 1 for Buy, -1 for Sell
+bool initialTradeOpened = false;
+bool equityStopTriggered = false;
+datetime lastHedgeTime = 0;
+double highestEquity = 0;
+double initialEntryPrice = 0;
+#define PIP 10
+
+// Objects for displaying information on chart
+string beLabel = "BreakEvenLabel";
+string rallyLabel = "TotalRallyLabel";
+string beValue = "BreakEvenValue";
+string rallyValue = "TotalRallyValue";
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   // Verify that we have enough lot sizes for the requested total counts
+   if(ArraySize(HedgeLotSizes) < TotalLotCounts)
+   {
+      Print("Error: Not enough hedge lot sizes in array for requested TotalLotCounts");
+      return(INIT_FAILED);
+   }
+   
+   highestEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   
+   // Create chart objects for display
+   CreateInfoLabels();
+   
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   // Remove chart objects when EA is removed
+   ObjectDelete(0, beLabel);
+   ObjectDelete(0, rallyLabel);
+   ObjectDelete(0, beValue);
+   ObjectDelete(0, rallyValue);
+}
+
+//+------------------------------------------------------------------+
+//| Create information labels on chart                                |
+//+------------------------------------------------------------------+
+void CreateInfoLabels()
+{
+   // Break-even label
+   ObjectCreate(0, beLabel, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, beLabel, OBJPROP_CORNER, CORNER_RIGHT_LOWER);
+   ObjectSetInteger(0, beLabel, OBJPROP_XDISTANCE, 10);
+   ObjectSetInteger(0, beLabel, OBJPROP_YDISTANCE, 60);
+   ObjectSetInteger(0, beLabel, OBJPROP_COLOR, clrWhite);
+   ObjectSetString(0, beLabel, OBJPROP_TEXT, "Break-even:");
+   ObjectSetInteger(0, beLabel, OBJPROP_FONTSIZE, 10);
+   
+   // Break-even value
+   ObjectCreate(0, beValue, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, beValue, OBJPROP_CORNER, CORNER_RIGHT_LOWER);
+   ObjectSetInteger(0, beValue, OBJPROP_XDISTANCE, 100);
+   ObjectSetInteger(0, beValue, OBJPROP_YDISTANCE, 60);
+   ObjectSetInteger(0, beValue, OBJPROP_COLOR, clrYellow);
+   ObjectSetString(0, beValue, OBJPROP_TEXT, "N/A");
+   ObjectSetInteger(0, beValue, OBJPROP_FONTSIZE, 10);
+   
+   // Total rally label
+   ObjectCreate(0, rallyLabel, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, rallyLabel, OBJPROP_CORNER, CORNER_RIGHT_LOWER);
+   ObjectSetInteger(0, rallyLabel, OBJPROP_XDISTANCE, 10);
+   ObjectSetInteger(0, rallyLabel, OBJPROP_YDISTANCE, 80);
+   ObjectSetInteger(0, rallyLabel, OBJPROP_COLOR, clrWhite);
+   ObjectSetString(0, rallyLabel, OBJPROP_TEXT, "Total rally:");
+   ObjectSetInteger(0, rallyLabel, OBJPROP_FONTSIZE, 10);
+   
+   // Total rally value
+   ObjectCreate(0, rallyValue, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, rallyValue, OBJPROP_CORNER, CORNER_RIGHT_LOWER);
+   ObjectSetInteger(0, rallyValue, OBJPROP_XDISTANCE, 100);
+   ObjectSetInteger(0, rallyValue, OBJPROP_YDISTANCE, 80);
+   ObjectSetInteger(0, rallyValue, OBJPROP_COLOR, clrYellow);
+   ObjectSetString(0, rallyValue, OBJPROP_TEXT, "N/A");
+   ObjectSetInteger(0, rallyValue, OBJPROP_FONTSIZE, 10);
+}
+
+//+------------------------------------------------------------------+
+//| Update information on chart                                       |
+//+------------------------------------------------------------------+
+void UpdateChartInfo()
+{
+   int totalPositions = CountOpenTrades();
+   
+   if(totalPositions == 0)
+   {
+      ObjectSetString(0, beValue, OBJPROP_TEXT, "N/A");
+      ObjectSetString(0, rallyValue, OBJPROP_TEXT, "N/A");
+      return;
+   }
+   
+   // Calculate break-even price
+   double totalLots = 0;
+   double weightedPrice = 0;
+   
+   for(int i = PositionsTotal()-1; i >=0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      
+      double lot = PositionGetDouble(POSITION_VOLUME);
+      double price = PositionGetDouble(POSITION_PRICE_OPEN);
+      
+      totalLots += lot;
+      weightedPrice += lot * price;
+   }
+   
+   if(totalLots > 0)
+   {
+      double breakEvenPrice = weightedPrice / totalLots;
+      double currentPrice = SymbolInfoDouble(_Symbol, direction == 1 ? SYMBOL_BID : SYMBOL_ASK);
+      double rallyPips = 0;
+      
+      if(direction == 1)
+         rallyPips = (currentPrice - breakEvenPrice) / (_Point * PIP);
+      else
+         rallyPips = (breakEvenPrice - currentPrice) / (_Point * PIP);
+      
+      ObjectSetString(0, beValue, OBJPROP_TEXT, DoubleToString(breakEvenPrice, _Digits));
+      ObjectSetString(0, rallyValue, OBJPROP_TEXT, DoubleToString(rallyPips, 1) + " pips");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   if(!EnableStrategy || equityStopTriggered) return;
+
+   UpdateHighestEquity();
+   if(EnableEquityStop && CheckEquityStop())
+   {
+      equityStopTriggered = true;
+      CloseAllTrades();
+      Alert("Equity stop triggered! All positions closed.");
+      return;
+   }
+
+   int totalTrades = CountOpenTrades();
+   if(totalTrades == 0)
+   {
+      if(CheckConsecutiveCandles(direction))
+      {
+         initialTradeOpened = true;
+         initialEntryPrice = SymbolInfoDouble(_Symbol, direction == 1 ? SYMBOL_ASK : SYMBOL_BID);
+         trade.SetExpertMagicNumber(MagicNumber);
+         Print("First Trade at price: ", initialEntryPrice);
+         trade.PositionOpen(_Symbol, direction == 1 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,
+                           InitialLotSize, initialEntryPrice,
+                           0,
+                           initialEntryPrice + (direction == 1 ? InitialTPPips : -InitialTPPips) * PIP * _Point);
+      }
+   }
+   else if(totalTrades < TotalLotCounts)
+   {
+      ManageHedging();
+   }
+
+   double totalProfit = GetTotalUnrealizedProfit();
+   if(totalProfit >= ProfitTargetPips * PIP * _Point)
+   {
+      CloseAllTrades();
+      initialTradeOpened = false;
+      initialEntryPrice = 0;
+   }
+   
+   // Update chart information on every tick
+   UpdateChartInfo();
+}
+//+------------------------------------------------------------------+
+//| Check equity drawdown                                            |
+//+------------------------------------------------------------------+
+bool CheckEquityStop()
+{
+   double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double drawdownPercent = 0;
+   
+   if(highestEquity > 0)
+   {
+      drawdownPercent = ((highestEquity - currentEquity) / highestEquity) * 100;
+   }
+   
+   return drawdownPercent >= MaxEquityDrawdownPercent;
+}
+
+//+------------------------------------------------------------------+
+//| Count open trades                                                |
+//+------------------------------------------------------------------+
+int CountOpenTrades()
+{
+   int count = 0;
+   for (int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if (PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+         count++;
+   }
+   return count;
+}
+
+//+------------------------------------------------------------------+
+//| Check consecutive candles                                        |
+//+------------------------------------------------------------------+
+bool CheckConsecutiveCandles(int &dir)
+{
+   bool bullish = true;
+   bool bearish = true;
+   double openArray[1], closeArray[1];
+
+   for (int i = 1; i <= ConsecutiveCandles; i++)
+   {
+      if (CopyOpen(_Symbol, _Period, i, 1, openArray) != 1 ||
+          CopyClose(_Symbol, _Period, i, 1, closeArray) != 1)
+         return false;
+
+      if (closeArray[0] <= openArray[0]) bullish = false;
+      if (closeArray[0] >= openArray[0]) bearish = false;
+   }
+
+   if (bullish) { dir = 1; return true; }
+   if (bearish) { dir = -1; return true; }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Manage hedging with fixed interval                               |
+//+------------------------------------------------------------------+
+void ManageHedging()
+{
+   if(initialEntryPrice == 0) return;
+    
+   double currentPrice = SymbolInfoDouble(_Symbol, direction == 1 ? SYMBOL_BID : SYMBOL_ASK);
+   int openCount = CountOpenTrades();
+   
+   if(openCount >= TotalLotCounts) return;
+   
+   double triggerPrice = initialEntryPrice;
+   if(direction == 1)
+   {
+      triggerPrice -= openCount * IntervalPips * PIP * _Point;
+   }
+   else
+   {
+      triggerPrice += openCount * IntervalPips * PIP * _Point;
+   }
+   
+   bool conditionMet = false;
+   if(direction == 1 && currentPrice <= triggerPrice)
+   {
+      conditionMet = true;
+   }
+   else if(direction == -1 && currentPrice >= triggerPrice)
+   {
+      conditionMet = true;
+   }
+   
+   if(conditionMet)
+   {
+      double lot = HedgeLotSizes[openCount];
+      double entryPrice = SymbolInfoDouble(_Symbol, direction == 1 ? SYMBOL_ASK : SYMBOL_BID);
+      trade.SetExpertMagicNumber(MagicNumber);
+      trade.PositionOpen(_Symbol, direction == 1 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,
+                         lot, entryPrice, 0, 0);
+      
+      if(openCount == 1)
+      {
+         RemoveInitialPositionTP();
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Remove TP from initial position                                  |
+//+------------------------------------------------------------------+
+void RemoveInitialPositionTP()
+{
+   ulong initialTicket = 0;
+   datetime earliestTime = D'3000.01.01';
+   
+   for(int i = PositionsTotal()-1; i >=0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      datetime posTime = PositionGetInteger(POSITION_TIME);
+      if(posTime < earliestTime)
+      {
+         earliestTime = posTime;
+         initialTicket = ticket;
+      }
+   }
+   
+   if(initialTicket == 0) return;
+   
+   if(positionInfo.SelectByTicket(initialTicket))
+   {
+      trade.PositionModify(initialTicket, positionInfo.StopLoss(), 0);
+      Print("Removed TP from initial position #", initialTicket);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get total unrealized profit                                      |
+//+------------------------------------------------------------------+
+double GetTotalUnrealizedProfit()
+{
+   double profit = 0;
+   for (int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if (PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+         profit += PositionGetDouble(POSITION_PROFIT);
+   }
+   return profit;
+}
+
+//+------------------------------------------------------------------+
+//| Close all trades                                                 |
+//+------------------------------------------------------------------+
+void CloseAllTrades()
+{
+   for (int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if (PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+      {
+         string symbol = PositionGetString(POSITION_SYMBOL);
+         trade.PositionClose(symbol);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Update highest equity                                            |
+//+------------------------------------------------------------------+
+void UpdateHighestEquity()
+{
+   double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(currentEquity > highestEquity)
+   {
+      highestEquity = currentEquity;
+   }
+}
